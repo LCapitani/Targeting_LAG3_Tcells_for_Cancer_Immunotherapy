@@ -1,0 +1,1783 @@
+
+
+
+```{r}
+library(TCGAbiolinks)
+library(tidyverse)
+library(SummarizedExperiment)
+require(limma)
+require(edgeR)
+
+
+setwd('E:/Lorenzo/Final_TCGA')
+projects_to_download = 'TCGA-COAD'
+
+COAD_query <- GDCquery(project = projects_to_download,
+              data.category = "Transcriptome Profiling",
+              data.type = "Gene Expression Quantification", 
+              workflow.type = "STAR - Counts",
+              sample.type = c('Primary Tumor'))
+
+GDCdownload(COAD_query, directory = 'E:/Lorenzo/Final_TCGA/COAD_data')
+
+COAD <- GDCprepare(COAD_query, directory = 'E:/Lorenzo/Final_TCGA/COAD_data')
+
+
+COAD_df <- assay(COAD, 'unstranded') %>% as.data.frame(.)
+
+# now to extract clinical information of value from the data
+clinical_COAD <- data.frame(COAD$patient,COAD$barcode,COAD$age_at_diagnosis,COAD$ajcc_pathologic_stage, COAD$days_to_diagnosis, COAD$vital_status, COAD$days_to_death, COAD$days_to_last_follow_up, COAD$tumor_grade, COAD$sample_type)
+colnames(clinical_COAD) <- gsub('COAD.', '', colnames(clinical_COAD))
+
+clinical_COAD$age_at_diagnosis <-  clinical_COAD$age_at_diagnosis/365
+```
+
+
+
+```{r}
+# get ID of gene of interest which should be used to cluster patients
+LAG3 <- 'ENSG00000089692'
+LAG3_id <- grep(LAG3,rownames(COAD_df), value=TRUE)
+FGL1 <- 'ENSG00000104760'
+FGL1_id <- grep(FGL1, rownames(COAD_df), value=TRUE)
+```
+
+
+
+
+```{r}
+#remove duplicated patient entries
+clinical_COAD <- clinical_COAD[!duplicated(clinical_COAD$patient),]
+
+#based on this subset the gene expression matrix to include only non-duplicated barcodes
+
+COAD_df <- COAD_df[,colnames(COAD_df) %in% clinical_COAD$barcode]
+
+dim(COAD_df)
+```
+
+
+Now normalize gene expression counts 
+
+```{r}
+library(DESeq2)
+library(biomaRt)
+library(rtracklayer)
+library(parallel)
+library(BiocParallel)
+```
+
+```{r}
+#removew two columns relating to sumitted id and project id
+
+require(DESeq2)
+clinical_COAD$project <- 'TCGA-COAD'
+COAD_matrix <- as.matrix(COAD_df)
+
+exptDesign_TCGA <- data.frame(
+  row.names = colnames(COAD_df),
+  condition = clinical_COAD$project)
+
+dds <- DESeqDataSetFromMatrix(
+  countData = COAD_matrix,
+  colData = exptDesign_TCGA,
+  design = ~ 1)
+
+dds <- DESeq2::estimateSizeFactors(dds)
+
+COAD_norm_counts <- DESeq2::counts(dds, normalized=TRUE) %>% as.data.frame(.)
+
+#load gene names
+gene_names <- read.table(file = 'E:/Lorenzo/Final_TCGA/7f9dadec-d447-41be-a192-637ce36467da.rna_seq.augmented_star_gene_counts.tsv', sep = '\t', header = TRUE)[-c(1:4),] %>% dplyr::select(gene_id, gene_name) %>% group_by(gene_name) %>% filter(row_number() <= 1) %>% as.data.frame(.)
+
+COAD_norm_counts <- COAD_norm_counts[rownames(COAD_norm_counts) %in% gene_names$gene_id,]
+
+rownames(COAD_norm_counts) <- gene_names$gene_name[match(gene_names$gene_id, rownames(COAD_norm_counts))]
+#remove missing sample
+COAD <- COAD[,(COAD$barcode %in% clinical_COAD$barcode)]
+
+
+
+```
+
+Now generate survival data
+```{r}
+require(tidyverse)
+COAD_survival <- clinical_COAD %>% as_tibble %>% 
+  add_column("times"=NA %>% as.integer(), .before=8)
+
+for (i in 1:nrow(COAD_survival)){
+  if (is.na( (COAD_survival[i , ]$days_to_death)) ){
+    COAD_survival[i , ]$times <- COAD_survival[i , ]$"days_to_last_follow_up"
+  }else
+  {
+    COAD_survival[i , ]$times <- COAD_survival[i , ]$"days_to_death"
+  }
+}
+
+COAD_survival$times <- as.integer(COAD_survival$times)
+COAD_survival$vital_status <- recode(COAD_survival$vital_status, 
+                                   Alive="0", Dead="1", `Not Reported` = NA_character_
+)
+COAD_survival$vital_status <- as.numeric(COAD_survival$vital_status)
+COAD_survival$vital_status[is.na(COAD_survival$vital_status)] <- 0
+
+require(survival)
+
+
+```
+
+Plot LAG-3 expression across MSI status
+
+```{r}
+temp <- cbind(COAD$barcode, COAD$paper_MSI_status) %>% as.data.frame(.)
+names(temp) <- c('barcode','MSI_status')
+
+
+COAD_LAG3_gene_counts <- COAD_norm_counts %>% as.data.frame(.) %>% .[rownames(.) == 'LAG3',]  %>% pivot_longer(cols = everything(), names_to = 'submitter_id', values_to =  'gene_count')
+names(COAD_LAG3_gene_counts) <- c('submitter_id','LAG3_counts')
+
+COAD_LAG3_gene_counts$MSI <- temp[match(temp$barcode, COAD_LAG3_gene_counts$submitter_id),]$MSI
+
+COAD_LAG3_gene_counts[is.na(COAD_LAG3_gene_counts$MSI),]$MSI <- 'Unclassified'
+
+COAD_LAG3_gene_counts <- COAD_LAG3_gene_counts %>% mutate(MSI = replace(MSI, MSI == '2', 'MSI-H')) %>% 
+  mutate(MSI = replace(MSI, MSI == '3', 'MSI-L'))%>% 
+  mutate(MSI = replace(MSI, MSI == '4', 'MSS'))
+
+
+
+COAD_LAG3_gene_counts$MSI <- factor(
+COAD_LAG3_gene_counts$MSI, levels = c('Unclassified','MSS','MSI-L','MSI-H'))
+
+c5 <- c(
+  "dodgerblue2", 
+  "#E31A1C", # red
+  "olivedrab",
+  "gold"
+)
+require(ggpubr)
+my_comparisons <- list(c('MSS','MSI-L'), c('MSS','MSI-H'), c('MSI-L','MSI-H'))
+
+png('E:/Lorenzo/Final_TCGA/COAD_data/LAG3_expression_across_MSI_subtype.png', width = 8000, height = 5800, res = 1120)
+COAD_LAG3_gene_counts %>%  ggplot(., aes(x = MSI, y = LAG3_counts, fill = MSI)) + 
+  geom_violin(draw_quantiles = c(0.25, 0.5, 0.75), show.legend = F) + 
+  xlab('Tumour subtype') +
+  ylab('Normalized gene counts of LAG-3') +
+  theme_pubclean() +
+  scale_y_continuous(trans = 'log10') +
+  stat_compare_means(comparisons = my_comparisons, label = "p.signif")+
+  scale_fill_manual(values =  c5) +
+  theme(text = element_text(size = 18))
+dev.off()
+
+
+```
+
+Survival by MSI type
+
+```{r}
+require(survival)
+require(survminer)
+
+COAD_survival$paper_MSI_status <- COAD_LAG3_gene_counts[match(COAD_LAG3_gene_counts$submitter_id, COAD_survival$barcode),]$MSI
+
+options(na.action = 'na.omit')
+
+fit_by_types <- survfit(Surv( times, vital_status ) ~ paper_MSI_status,
+               data = COAD_survival )
+
+
+png('E:/Lorenzo/Final_TCGA/COAD_data/COAD_survival_by_cancer_types.png', width = 9600, height = 5600, res = 1120)
+ggsurvplot(fit_by_types, COAD_survival ,
+                    palette = c5,
+                    legend.labs = c('Unclassified','MSS','MSI-L','MSI-H'),
+                    risk.table = T, 
+                    risk.table.height = 0.4,
+                    pval = TRUE, 
+                    pval.coord = c(1500, 0.95),
+                    xlim=c(0,2000), 
+                    ylim = c(0,1),
+                    break.x.by = 500,
+                   # title = c("CTL Clustering"),
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           legend.title ='Tumour classification',
+  ggtheme = theme_classic2(base_size=16, base_family = "Arial"),
+           font.family = "Arial")
+dev.off()
+
+```
+
+Now, lets save the data to csv for CIBERSORT analysis
+
+```{r}
+
+COAD_norm_counts$Gene <- rownames(COAD_norm_counts)
+COAD_norm_counts <- COAD_norm_counts %>% group_by(Gene) %>% filter(row_number() <= 1)
+COAD_norm_counts <- COAD_norm_counts[!is.na(COAD_norm_counts$Gene),]
+# replace first col with gene symbol
+COAD_norm_counts_export <- COAD_norm_counts %>% as.data.frame(.)
+
+
+COAD_norm_counts_export <-  cbind(COAD_norm_counts_export$Gene, COAD_norm_counts_export[,-ncol(COAD_norm_counts_export)])
+names(COAD_norm_counts_export)[1] <- 'Gene'
+
+#READ IN LM22 TO KNOW WHICH GENES WE NEED TO KEEP
+
+lm22 <- read.table('C:/Users/Standard User/Downloads/LM22.txt', header = T, sep = '\t')
+
+COAD_norm_counts_export <- COAD_norm_counts_export[COAD_norm_counts_export$Gene %in% lm22$Gene.symbol,]
+
+
+write.table(COAD_norm_counts_export,file = 'E:/Lorenzo/Final_TCGA/COAD_norm_counts.txt',sep="\t",row.names=F, col.names = T)
+
+
+```
+
+Let's confirm that everything thus far is working by plotting survival clustered by LAG3 and see if we get the same as last time
+
+```{r}
+require(survminer)
+require(survival)
+require(ClusterR)
+
+
+COAD_LAG3_gene_counts$status <- clinical_COAD$Status[match(COAD_LAG3_gene_counts$submitter_id, clinical_COAD$barcode)]
+
+
+LAG3_clusters <- Cluster_Medoids( center_scale( 
+      COAD_LAG3_gene_counts %>% dplyr::select(all_of('LAG3_counts')) %>% as.matrix(.),mean_center = T, sd_scale = T ),clusters = 2, distance_metric = "manhattan",  swap_phase = T)
+COAD_LAG3_gene_counts$clusters <- as.character(LAG3_clusters$clusters)
+
+COAD_LAG3_gene_counts <-  COAD_LAG3_gene_counts %>% 
+  mutate(clusters = ifelse(clusters == COAD_LAG3_gene_counts %>% group_by(clusters) %>%summarize(mean_LAG3 = mean(LAG3_counts)) %>% .[.$mean_LAG3 ==max(.$mean_LAG3),] %>% dplyr::select('clusters') %>% .$'clusters', 'LAG3 high', 'LAG3 low'))
+  
+
+COAD_survival$LAG3_cluster <- COAD_LAG3_gene_counts[match(COAD_survival$barcode, COAD_LAG3_gene_counts$submitter_id),]$clusters
+
+
+
+fit_by_LAG3_cluster <- survfit(Surv( times, vital_status ) ~ LAG3_cluster,
+               data = COAD_survival )
+
+png('E:/Lorenzo/Final_TCGA/COAD_data/COAD_survival_by_LAG3.png', width = 9600, height = 5600, res = 1120)
+ggsurvplot(fit_by_LAG3_cluster, COAD_survival,
+                    #legend.labs = c("Other", "TripleNegative"),
+                    palette = c("red", "gold"),
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(1000, 0.9),
+                    ggtheme = theme_survminer(),
+                    xlim=c(0,2000), 
+                    break.x.by = 500,
+                   # title = c("CTL Clustering"),
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           legend.title ='LAG3 cluster',
+           legend.labs = c("LAG3 High", "LAG3 Low"))
+dev.off()
+```
+
+
+# FGL1 analysis
+
+```{r}
+require(survminer)
+require(survival)
+
+ COAD_FGL1_gene_counts <- COAD_norm_counts %>% as.data.frame(.) %>% filter(Gene == 'FGL1')  %>% dplyr::select(-Gene) %>%  pivot_longer(cols = everything(), names_to = 'submitter_id', values_to =  'gene_count')
+
+
+#add status to norm_counts data
+
+COAD_FGL1_gene_counts$status <- clinical_COAD$Status[match(COAD_FGL1_gene_counts$submitter_id, clinical_COAD$barcode)]
+
+COAD_FGL1_gene_counts$FGL1_group <- ntile(COAD_FGL1_gene_counts$gene_count, 4)  
+COAD_FGL1_gene_counts <- COAD_FGL1_gene_counts %>%                              
+  mutate(FGL1_group = replace(FGL1_group, FGL1_group == 1, 'Q1'))  %>%                              
+  mutate(FGL1_group = replace(FGL1_group, FGL1_group == 2, 'Q2')) %>%                              
+  mutate(FGL1_group = replace(FGL1_group, FGL1_group == 3, 'Q3')) %>%                              
+  mutate(FGL1_group = replace(FGL1_group, FGL1_group == 4, 'Q4')) 
+
+COAD_survival$FGL1_cluster <- COAD_FGL1_gene_counts[match(COAD_survival$barcode, COAD_FGL1_gene_counts$submitter_id),]$FGL1_group
+
+fit_by_FGL1_cluster <- survfit(Surv( times, vital_status ) ~ FGL1_cluster,
+               data = COAD_survival )
+
+png('E:/Lorenzo/Final_TCGA/COAD_data/COAD_survival_by_FGL1.png', width = 9600, height = 6500, res = 1120)
+ggsurvplot(fit_by_FGL1_cluster, COAD_survival,
+                    #legend.labs = c("Other", "TripleNegative"),
+                    #palette = c("red", "cornflowerblue"),
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(3500, 0.9),
+                    ggtheme = theme_survminer(),
+                    xlim=c(0,5000), 
+                    break.x.by = 1000,
+                   # title = c("CTL Clustering"),
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           legend.title ='FGL1 quasrtile',
+           legend.labs = c('Q1','Q2','Q3','Q4'))
+dev.off()
+
+
+```
+
+# Now let's replicate the CIBERSORT analysis
+# Previously, we had seen the in TCGA COAD CTL hi meant better survival
+
+
+```{r}
+COAD_CBSRT <- read.csv('C:/Users/Standard User/Downloads/CIBERSORTx_Job4_Results.csv')
+
+# match the COAD survival to the number of cell types for each sample
+
+COAD_survival[,15:36] <-  COAD_CBSRT[match(COAD_survival$barcode, COAD_CBSRT$Mixture),][,2:23]
+
+COAD_survival %>% pivot_longer(cols = !c(1:15), names_to = 'Cell_type',values_to = 'percentage') %>% .[!is.na(.$percentage),] %>% split(., f = .$Cell_type) %>% lapply(., function(x) {
+  cell_type_cluster <- Cluster_Medoids( center_scale( 
+      x %>% dplyr::select(all_of('percentage')) %>% as.matrix(.),mean_center = T, sd_scale = T ),clusters = 2, distance_metric = "manhattan",  swap_phase = T)
+  x$cell_type_cluster <- as.character(cell_type_cluster$clusters)
+  x_summarized <- x %>%
+    group_by(cell_type_cluster) %>%
+    dplyr::summarize(Mean_percentage = mean(percentage, na.rm=TRUE))
+  if ( x_summarized$Mean_percentage[1] > x_summarized$Mean_percentage[2]) {
+    x <- x %>%                              
+  mutate(cell_type_cluster = replace(cell_type_cluster, cell_type_cluster == 1, 'High'))  %>%                              
+  mutate(cell_type_cluster = replace(cell_type_cluster, cell_type_cluster == 2, 'Low')) 
+  }
+  else {
+        x <- x %>%                              
+  mutate(cell_type_cluster = replace(cell_type_cluster, cell_type_cluster == 1, 'Low'))  %>%                              
+  mutate(cell_type_cluster = replace(cell_type_cluster, cell_type_cluster == 2, 'High')) 
+
+    
+  }
+    cell_type <- gsub('\\.', ' ', unique(x$Cell_type))
+  
+  fit_by_cell_type_cluster <- survfit(Surv( times, vital_status ) ~ cell_type_cluster,
+                 data = x )
+
+  plot <- ggsurvplot(fit_by_cell_type_cluster, x,
+                    #legend.labs = c("Other", "TripleNegative"),
+                    palette = c("red", "cornflowerblue"),
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(1500, 0.5),
+                    ggtheme = theme_survminer(),
+                    xlim=c(0,3000), 
+                    break.x.by = 1000,
+                   title = paste('All samples -', cell_type),
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           legend.title = cell_type,
+           legend.labs = c('High cluster','Low cluster'))
+  path = paste(paste('E:/Lorenzo/Final_TCGA/COAD_surv_plots/All/', cell_type, sep=''), '.pdf', sep='')
+  pdf(path)
+  print(plot, newpage = FALSE)
+  dev.off()
+
+})
+
+```
+
+
+# Plot survival with CD8 hi and LAG3 clustering 
+
+```{r}
+COAD_LAG3_gene_counts$T.cell.CD8 <- COAD_CBSRT[match(COAD_LAG3_gene_counts$submitter_id, COAD_CBSRT$Mixture),]$T.cells.CD8
+COAD_LAG3_gene_counts$clusters <- NULL
+COAD_LAG3_gene_counts$CD8_cluster <- NULL
+COAD_LAG3_gene_counts$status <- NULL
+colnames(COAD_LAG3_gene_counts)[2] <- 'LAG3'
+COAD_LAG3_gene_counts$LAG3_cluster <- 'LAG3'
+
+
+COAD_LAG3_gene_counts <- COAD_LAG3_gene_counts[!is.na(COAD_LAG3_gene_counts$T.cell.CD8),]
+
+cluster_data <- Cluster_Medoids(center_scale( as.matrix(COAD_LAG3_gene_counts %>% dplyr::select(all_of('T.cell.CD8'))), 
+                                              mean_center = T, sd_scale = T ),
+                                clusters = 2, 
+                                distance_metric = "manhattan", 
+                                swap_phase = T, 
+                                seed = 123)
+    
+COAD_LAG3_gene_counts <- COAD_LAG3_gene_counts %>% mutate("CTL_cluster"= (cluster_data$clusters %>% as.character))
+    
+clust_1_mean <- mean(as.list(COAD_LAG3_gene_counts[COAD_LAG3_gene_counts$CTL_cluster == 1,] %>% dplyr::select(all_of('T.cell.CD8')))[[1]])
+clust_2_mean <- mean(as.list(COAD_LAG3_gene_counts[COAD_LAG3_gene_counts$CTL_cluster == 2,] %>% dplyr::select(all_of('T.cell.CD8')))[[1]])
+
+clust_1_status <- ifelse(clust_1_mean > clust_2_mean, "CTL High", "CTL Low")
+clust_2_status <- ifelse(clust_2_mean > clust_1_mean, "CTL High", "CTL Low")
+
+COAD_LAG3_gene_counts[COAD_LAG3_gene_counts$CTL_cluster == 1,]$CTL_cluster <- clust_1_status
+COAD_LAG3_gene_counts[COAD_LAG3_gene_counts$CTL_cluster == 2,]$CTL_cluster <- clust_2_status
+
+
+#Second level of clustering
+cluster_data <- Cluster_Medoids(center_scale( as.matrix(COAD_LAG3_gene_counts %>% dplyr::select(all_of('LAG3'))), 
+                                              mean_center = T, sd_scale = T ),
+                                clusters = 2, 
+                                distance_metric = "manhattan", 
+                                swap_phase = T, 
+                                seed = 123)
+COAD_LAG3_gene_counts <- COAD_LAG3_gene_counts %>% mutate("LAG3_cluster"= (cluster_data$clusters %>% as.character))
+
+ clust_1_mean <- mean(as.list(COAD_LAG3_gene_counts[COAD_LAG3_gene_counts$LAG3_cluster == 1,] %>% dplyr::select(all_of('LAG3')))[[1]])
+clust_2_mean <- mean(as.list(COAD_LAG3_gene_counts[COAD_LAG3_gene_counts$LAG3_cluster == 2,] %>% dplyr::select(all_of('LAG3')))[[1]])
+
+clust_1_status <- ifelse(clust_1_mean > clust_2_mean, "LAG3 High", "LAG3 Low")
+clust_2_status <- ifelse(clust_2_mean > clust_1_mean, "LAG3 High", "LAG3 Low")
+
+COAD_LAG3_gene_counts[COAD_LAG3_gene_counts$LAG3_cluster == 1,]$LAG3_cluster <- clust_1_status
+COAD_LAG3_gene_counts[COAD_LAG3_gene_counts$LAG3_cluster == 2,]$LAG3_cluster <- clust_2_status
+
+COAD_survival$LAG3_cluster <- COAD_LAG3_gene_counts[match(COAD_survival$barcode, COAD_LAG3_gene_counts$submitter_id),]$LAG3_cluster
+COAD_survival$CTL_cluster <- COAD_LAG3_gene_counts[match(COAD_survival$barcode, COAD_LAG3_gene_counts$submitter_id),]$CTL_cluster
+
+
+fit_CD8hi_LAG3_cluster <- survfit(Surv( times, vital_status ) ~ LAG3_cluster,
+                 data = COAD_survival[COAD_survival$CTL_cluster == 'CTL High',] )
+
+png('E:/Lorenzo/Final_TCGA/COAD_data/CD8high_survival_by_LAG3.png', width = 8000, height = 7000, res = 1000)
+ggsurvplot(fit_CD8hi_LAG3_cluster,
+                    palette = c("red4", "red1"),
+                    legend.labs = c('CD8 T cell high\nLAG3 high','CD8 T cell high\nLAG3 low'),
+           legend.title ='CD8 T cell and LAG3\nexpression group',
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(1500, 0.4),
+           ggtheme = theme_classic2(base_size=16, base_family = "Arial"),
+           font.family = "Arial",
+                    xlim=c(0,2500), 
+                    break.x.by = 500,
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           title = 'CD8+ high - clustered by LAG3')
+          # legend.title = cell_type,
+dev.off()
+
+
+fit_CD8low_LAG3_cluster <- survfit(Surv( times, vital_status ) ~ LAG3_cluster,
+                 data = COAD_survival[COAD_survival$CTL_cluster == 'CTL Low',] )
+
+png('E:/Lorenzo/Final_TCGA/COAD_data/CD8low_survival_by_LAG3.png', width = 8000, height = 7000, res = 1000)
+ggsurvplot(fit_CD8low_LAG3_cluster,
+                    palette = c("red4", "red1"),
+                    legend.labs = c('CD8 T cell low\nLAG3 high','CD8 T cell low\nLAG3 low'),
+           legend.title ='CD8 T cell and LAG3\nexpression group',
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(1500, 0.4),
+           ggtheme = theme_classic2(base_size=16, base_family = "Arial"),
+           font.family = "Arial",
+                    xlim=c(0,2500), 
+                    break.x.by = 500,
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           title = 'CD8+ low - clustered by LAG3')
+          # legend.title = cell_type,
+dev.off()
+
+
+
+```
+
+# Also replot COAD with Treg hi and look at LAG3 clustering effect on survival
+
+
+```{r}
+COAD_LAG3_gene_counts$T.cells.regulatory..Tregs. <- COAD_CBSRT[match(COAD_LAG3_gene_counts$submitter_id, COAD_CBSRT$Mixture),]$T.cells.regulatory..Tregs.
+COAD_LAG3_gene_counts$clusters <- NULL
+COAD_LAG3_gene_counts$Treg_cluster <- NULL 
+COAD_LAG3_gene_counts$status <- NULL
+COAD_LAG3_gene_counts$LAG3_cluster <- 'LAG3'
+
+
+COAD_LAG3_gene_counts <- COAD_LAG3_gene_counts[!is.na(COAD_LAG3_gene_counts$T.cells.regulatory..Tregs.),]
+
+cluster_data <- Cluster_Medoids(center_scale( as.matrix(COAD_LAG3_gene_counts %>% dplyr::select(all_of('T.cells.regulatory..Tregs.'))), 
+                                              mean_center = T, sd_scale = T ),
+                                clusters = 2, 
+                                distance_metric = "manhattan", 
+                                swap_phase = T, 
+                                seed = 123)
+    
+COAD_LAG3_gene_counts <- COAD_LAG3_gene_counts %>% mutate("Treg_cluster"= (cluster_data$clusters %>% as.character))
+    
+clust_1_mean <- mean(as.list(COAD_LAG3_gene_counts[COAD_LAG3_gene_counts$Treg_cluster == 1,] %>% dplyr::select(all_of('T.cells.regulatory..Tregs.')))[[1]])
+clust_2_mean <- mean(as.list(COAD_LAG3_gene_counts[COAD_LAG3_gene_counts$Treg_cluster == 2,] %>% dplyr::select(all_of('T.cells.regulatory..Tregs.')))[[1]])
+
+clust_1_status <- ifelse(clust_1_mean > clust_2_mean, "Treg High", "Treg Low")
+clust_2_status <- ifelse(clust_2_mean > clust_1_mean, "Treg High", "Treg Low")
+
+COAD_LAG3_gene_counts[COAD_LAG3_gene_counts$Treg_cluster == 1,]$Treg_cluster <- clust_1_status
+COAD_LAG3_gene_counts[COAD_LAG3_gene_counts$Treg_cluster == 2,]$Treg_cluster <- clust_2_status
+
+
+#Second level of clustering
+cluster_data <- Cluster_Medoids(center_scale( as.matrix(COAD_LAG3_gene_counts %>% dplyr::select(all_of('LAG3'))), 
+                                              mean_center = T, sd_scale = T ),
+                                clusters = 2, 
+                                distance_metric = "manhattan", 
+                                swap_phase = T, 
+                                seed = 123)
+COAD_LAG3_gene_counts <- COAD_LAG3_gene_counts %>% mutate("LAG3_cluster"= (cluster_data$clusters %>% as.character))
+
+ clust_1_mean <- mean(as.list(COAD_LAG3_gene_counts[COAD_LAG3_gene_counts$LAG3_cluster == 1,] %>% dplyr::select(all_of('LAG3')))[[1]])
+clust_2_mean <- mean(as.list(COAD_LAG3_gene_counts[COAD_LAG3_gene_counts$LAG3_cluster == 2,] %>% dplyr::select(all_of('LAG3')))[[1]])
+
+clust_1_status <- ifelse(clust_1_mean > clust_2_mean, "LAG3 High", "LAG3 Low")
+clust_2_status <- ifelse(clust_2_mean > clust_1_mean, "LAG3 High", "LAG3 Low")
+
+COAD_LAG3_gene_counts[COAD_LAG3_gene_counts$LAG3_cluster == 1,]$LAG3_cluster <- clust_1_status
+COAD_LAG3_gene_counts[COAD_LAG3_gene_counts$LAG3_cluster == 2,]$LAG3_cluster <- clust_2_status
+
+COAD_survival$LAG3_cluster <- COAD_LAG3_gene_counts[match(COAD_survival$barcode, COAD_LAG3_gene_counts$submitter_id),]$LAG3_cluster
+COAD_survival$Treg_cluster <- COAD_LAG3_gene_counts[match(COAD_survival$barcode, COAD_LAG3_gene_counts$submitter_id),]$Treg_cluster
+
+
+fit_Treghi_LAG3_cluster <- survfit(Surv( times, vital_status ) ~ LAG3_cluster,
+                 data = COAD_survival[COAD_survival$Treg_cluster == 'Treg High',] )
+
+png('E:/Lorenzo/Final_TCGA/COAD_data/Treghigh_survival_by_LAG3.png', width = 8000, height = 7000, res = 1000)
+ggsurvplot(fit_Treghi_LAG3_cluster,
+                    palette = c("red4", "red1"),
+                    legend.labs = c('Treg T cell high\nLAG3 high','Treg T cell high\nLAG3 low'),
+           legend.title ='Treg T cell and LAG3\nexpression group',
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(1500, 0.4),
+           ggtheme = theme_classic2(base_size=16, base_family = "Arial"),
+           font.family = "Arial",
+                    xlim=c(0,2500), 
+                    break.x.by = 500,
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           title = 'Treg+ high - clustered by LAG3')
+          # legend.title = cell_type,
+dev.off()
+
+
+fit_Treglow_LAG3_cluster <- survfit(Surv( times, vital_status ) ~ LAG3_cluster,
+                 data = COAD_survival[COAD_survival$Treg_cluster == 'Treg Low',] )
+
+png('E:/Lorenzo/Final_TCGA/COAD_data/Treglow_survival_by_LAG3.png', width = 8000, height = 7000, res = 1000)
+ggsurvplot(fit_Treglow_LAG3_cluster,
+                    palette = c("red4", "red1"),
+                    legend.labs = c('Treg T cell low\nLAG3 high','Treg T cell low\nLAG3 low'),
+           legend.title ='Treg T cell and LAG3\nexpression group',
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(1500, 0.4),
+           ggtheme = theme_classic2(base_size=16, base_family = "Arial"),
+           font.family = "Arial",
+                    xlim=c(0,2500), 
+                    break.x.by = 500,
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           title = 'Treg+ low - clustered by LAG3')
+          # legend.title = cell_type,
+dev.off()
+
+
+```
+
+
+
+GSVA of CD8high LAG3 high vs CD8 high LAG3 low 
+
+```{r}
+library(GSVA)
+
+gage_dataset_COAD <- COAD_norm_counts 
+gage_dataset_COAD <- gage_dataset_COAD[!duplicated(gage_dataset_COAD$Gene),]
+gage_dataset_COAD <- gage_dataset_COAD[!is.na(gage_dataset_COAD$Gene),] %>% as.data.frame(.)
+rownames(gage_dataset_COAD) <- gage_dataset_COAD$Gene
+gage_dataset_COAD$Gene <- NULL
+gage_dataset_COAD <- as.matrix(gage_dataset_COAD)
+
+library(qusage)
+# Reactome Pathway Analysis
+all_paths_gmt <- read.gmt("E:/Lorenzo/Final_TCGA/ReactomePathways.gmt") %>% map(function(x){ x[-1]} ) # Removes the first entry of each 
+gmt_df <- tibble("Pathway"=map(all_paths_gmt, unlist)%>%names(), "Genes"=map(all_paths_gmt, unlist) )
+#makes a tibble with reactome gene names and gene lists
+library(magrittr)
+all_paths <- read.table("E:/Lorenzo/Final_TCGA/ReactomePathways.txt", sep = "\t", header = F) %>% 
+  as_tibble() %>%
+  filter({grepl("HSA", (.)$V1)}) %>% 
+  filter({grepl("Homo sapiens", (.)$V3)}) %>% 
+  set_colnames(c("Code", "Pathway", "Species") ) %>%
+  left_join(gmt_df, by="Pathway") %>%
+  add_column("Number"=map_dbl((.)$Genes, length)) %>% 
+  dplyr::arrange(desc(Number))
+
+
+all_paths_list <- all_paths %>% filter(Number>10) %>% 
+  filter(Number<1000) %>% pull(Genes)
+names(all_paths_list) <- all_paths %>% filter(Number>10) %>% 
+  filter(Number<1000) %>% pull(Pathway)
+
+
+#Subset dataset to COAD patients by colnames that are equal to rownames of CBSRT df where project ID = TCGA-COAD
+
+library(GSVA)
+gsva_lag3hi_vs_lag3low_COAD <- gsva(gage_dataset_COAD, 
+     all_paths_list, 
+     method=c("gsva"), 
+     kcdf=c("Gaussian"),
+     min.sz=10,
+     max.sz=500,
+     mx.diff=F,
+     verbose = T)
+
+#Make tibble with patient ID and LAG3 expression group
+patient_code_COAD <- COAD_survival %>% dplyr::select(CTL_cluster, LAG3_cluster) %>% as.data.frame(.)
+rownames(patient_code_COAD) <- COAD_survival$barcode
+
+## Fit the same linear model now to the GSVA enrichment scores 
+ctl <- factor(patient_code_COAD$CTL_cluster)
+lag3 <- factor(patient_code_COAD$LAG3_cluster)
+design <- model.matrix(~0+ctl:lag3)
+colnames(design) <- c("CTLhi_LAG3hi", "CTLlow_LAG3hi", "CTLhi_LAG3low","CTLlow_LAG3low")
+
+options(na.action="na.pass")
+
+fit_gsva_coad <- lmFit(gsva_lag3hi_vs_lag3low_COAD, design=design)
+## Define contrasts
+contrast.matrix <- makeContrasts(CTLhi_LAG3hi-CTLhi_LAG3low, levels = design)
+fit2_gsva_coad <- contrasts.fit(fit_gsva_coad, contrast.matrix)
+## estimate moderated t-statistics 
+fit2_gsva_coad <- eBayes(fit2_gsva_coad)
+
+COAD_CTLhigh_top_genes <- topTable(fit2_gsva_coad, adjust = "BH", number = 100)
+COAD_CTLhigh_top_genes <- COAD_CTLhigh_top_genes[order(COAD_CTLhigh_top_genes$logFC, decreasing = T),]
+COAD_CTLhigh_top_genes
+
+
+```
+
+
+
+```{r}
+library(TCGAbiolinks)
+library(tidyverse)
+library(SummarizedExperiment)
+
+```
+
+
+
+```{r}
+setwd('E:/Lorenzo/Final_TCGA')
+projects_to_download = 'TCGA-BRCA'
+
+BRCA_query <- GDCquery(project = projects_to_download,
+              data.category = "Transcriptome Profiling",
+              data.type = "Gene Expression Quantification", 
+              workflow.type = "STAR - Counts",
+              sample.type = c('Primary Tumor'))
+
+GDCdownload(BRCA_query, directory = 'E:/Lorenzo/Final_TCGA/BRCA_data')
+
+BRCA <- GDCprepare(BRCA_query, directory =  'E:/Lorenzo/Final_TCGA/BRCA_data')
+
+
+BRCA_df <- assay(BRCA, 'unstranded') %>% as.data.frame(.)
+
+# now to extract clinical information of value from the data
+clinical_BRCA <- data.frame(BRCA$patient,BRCA$barcode,BRCA$age_at_diagnosis,BRCA$ajcc_pathologic_stage, BRCA$days_to_diagnosis, BRCA$vital_status, BRCA$days_to_death, BRCA$days_to_last_follow_up, BRCA$tumor_grade, BRCA$sample_type)
+colnames(clinical_BRCA) <- gsub('BRCA.', '', colnames(clinical_BRCA))
+
+clinical_BRCA$age_at_diagnosis <-  clinical_BRCA$age_at_diagnosis/365
+```
+
+
+
+```{r}
+# get ID of gene of interest which should be used to cluster patients
+LAG3 <- 'ENSG00000089692'
+LAG3_id <- grep(LAG3,rownames(BRCA_df), value=TRUE)
+FGL1 <- 'ENSG00000104760'
+FGL1_id <- grep(FGL1, rownames(BRCA_df), value=TRUE)
+```
+
+Finding samples in the BRCA dataset that are triple negative breast cancer
+
+```{r}
+triple_neg_info <- read.delim('E:/Lorenzo/GDCdata/TCGA-BRCA/harmonized/Clinical/Clinical_Supplement/8162d394-8b64-4da2-9f5b-d164c54b9608/nationwidechildrens.org_clinical_patient_brca.txt', header = TRUE, sep = "\t")
+
+# remove top two rows of table as they are artefacts
+triple_neg_info <- triple_neg_info[3:nrow(triple_neg_info),]
+# information relating to the status is under the following columns
+# 'er_status_by_ihc'
+# 'pr_status_by_ihc'
+# 'her2_status_by_ihc',
+# possible values: "Positive"        "Negative"        "[Not Evaluated]" "Indeterminate"  
+
+triple_neg_info <- triple_neg_info %>% dplyr::select(c(bcr_patient_uuid,bcr_patient_barcode,er_status_by_ihc,pr_status_by_ihc,her2_status_by_ihc))
+
+
+#clinical_BRCA <- clinical_BRCA[match(triple_neg_info$bcr_patient_barcode, clinical_BRCA$patient),]
+clinical_BRCA$ER_status <- triple_neg_info[match(clinical_BRCA$patient, triple_neg_info$bcr_patient_barcode),]$er_status_by_ihc
+clinical_BRCA$PR_status <- triple_neg_info[match(clinical_BRCA$patient, triple_neg_info$bcr_patient_barcode),]$pr_status_by_ihc
+clinical_BRCA$HER2_status <- triple_neg_info[match(clinical_BRCA$patient, triple_neg_info$bcr_patient_barcode),]$her2_status_by_ihc
+
+# set TNBC status
+clinical_BRCA <- clinical_BRCA %>% 
+   mutate(TNBC_status = ifelse(ER_status == 'Positive' & 
+                PR_status == "Positive" &
+                HER2_status == "Positive", 
+                          "TNBC", "Other"))
+
+clinical_BRCA <- clinical_BRCA[!is.na(clinical_BRCA$barcode),]
+clinical_BRCA <- clinical_BRCA[!is.na(clinical_BRCA$ER_status),]
+#based on this subset the gene expression matrix to include only non-duplicated barcodes
+BRCA_df <- BRCA_df[,colnames(BRCA_df) %in% clinical_BRCA$barcode]
+
+gene_names <- read.table(file = 'E:/Lorenzo/Final_TCGA/7f9dadec-d447-41be-a192-637ce36467da.rna_seq.augmented_star_gene_counts.tsv', sep = '\t', header = TRUE)[-c(1:4),] %>% dplyr::select(gene_id, gene_name) %>% group_by(gene_name) %>% filter(row_number() <= 1) %>% as.data.frame(.)
+
+
+BRCA_df <- BRCA_df[rownames(BRCA_df) %in% gene_names$gene_id,]
+
+rownames(BRCA_df) <- gene_names$gene_name[match(gene_names$gene_id, rownames(BRCA_df))]
+
+
+clinical_BRCA$subtype <- 'Unclassified'
+
+clinical_BRCA[((clinical_BRCA$ER_status == 'Positive')|
+                (clinical_BRCA$PR_status == 'Positive')) &
+                (clinical_BRCA$HER2_status == 'Negative'), 
+                ]$subtype <- 'Luminal A' 
+
+clinical_BRCA[((clinical_BRCA$ER_status == 'Positive')|
+                (clinical_BRCA$PR_status == 'Positive')) &
+                (clinical_BRCA$HER2_status == 'Positive'), 
+                ]$subtype <- 'Luminal B' 
+
+clinical_BRCA[(clinical_BRCA$ER_status == 'Negative') &
+                (clinical_BRCA$PR_status == 'Negative') &
+                (clinical_BRCA$HER2_status == 'Positive'), 
+                ]$subtype <- 'Non-luminal HER2+' 
+
+clinical_BRCA[(clinical_BRCA$ER_status == 'Negative') &
+                (clinical_BRCA$PR_status == 'Negative') &
+                (clinical_BRCA$HER2_status == 'Negative'), 
+                ]$subtype <- 'Triple negative' 
+
+
+BRCA <- BRCA[,(BRCA$barcode %in% clinical_BRCA$barcode)]
+
+BRCA$subtype <- clinical_BRCA$subtype
+
+```
+
+Now normalize gene expression counts 
+
+```{r}
+library(DESeq2)
+library(biomaRt)
+library(rtracklayer)
+```
+
+```{r}
+#removew two columns relating to sumitted id and project id
+
+require(DESeq2)
+BRCA_matrix <- as.matrix(BRCA_df)
+
+exptDesign_TCGA <- data.frame(
+  row.names = colnames(BRCA_df),
+  condition = clinical_BRCA$subtype)
+
+dds <- DESeqDataSetFromMatrix(
+  countData = BRCA_matrix,
+  colData = exptDesign_TCGA,
+  design = ~ 1)
+
+dds <- DESeq2::estimateSizeFactors(dds)
+
+BRCA_norm_counts <- DESeq2::counts(dds, normalized=TRUE) %>% as.data.frame(.)
+
+```
+
+Now generate survival data
+```{r}
+require(tidyverse)
+BRCA_survival <- clinical_BRCA %>% as_tibble %>% 
+  add_column("times"=NA %>% as.integer(), .before=8)
+
+for (i in 1:nrow(BRCA_survival)){
+  if (is.na( (BRCA_survival[i , ]$days_to_death)) ){
+    BRCA_survival[i , ]$times <- BRCA_survival[i , ]$"days_to_last_follow_up"
+  }else
+  {
+    BRCA_survival[i , ]$times <- BRCA_survival[i , ]$"days_to_death"
+  }
+}
+
+BRCA_survival$times <- as.integer(BRCA_survival$times)
+BRCA_survival$vital_status <- recode(BRCA_survival$vital_status, 
+                                   Alive="0", Dead="1", `Not Reported` = NA_character_
+)
+BRCA_survival$vital_status <- as.numeric(BRCA_survival$vital_status)
+
+
+require(survival)
+
+
+```
+
+# start by ploting LAG3 expression across the sample subsets
+
+```{r}
+
+
+temp <- clinical_BRCA %>% dplyr::select(barcode,sample_type,subtype)
+
+BRCA_LAG3_gene_counts <- BRCA_norm_counts[grep('LAG3',rownames(BRCA_norm_counts)),] %>% as.data.frame(.) %>% pivot_longer(cols = everything(), names_to = 'submitter_id', values_to =  'gene_count')
+names(BRCA_LAG3_gene_counts) <- c('submitter_id','LAG3_counts')
+
+BRCA_LAG3_gene_counts$subtype <- temp[match(temp$barcode, BRCA_LAG3_gene_counts$submitter_id),]$subtype
+
+BRCA_LAG3_gene_counts$subtype <- factor(
+BRCA_LAG3_gene_counts$subtype, levels = c('Unclassified','Luminal A','Luminal B','Non-luminal HER2+','Triple negative'))
+
+
+require(ggpubr)
+my_comparisons <- list(  c('Luminal A','Luminal B'),
+    c('Luminal A','Non-luminal HER2+'),
+    c('Luminal A', 'Triple negative') )
+
+
+c6 <- c(
+  "dodgerblue2", # red
+  "#6A3D9A", # purple
+  "#FF7F00", # orange
+  "olivedrab",
+  "gold"
+)
+
+
+png('E:/Lorenzo/Final_TCGA/BRCA_data/LAG3_expression_across_cancer_subtypes.png', width = 8000, height = 5800, res = 1120)
+BRCA_LAG3_gene_counts  %>%  ggplot(., aes(x = subtype, y = LAG3_counts, fill = subtype)) + 
+  geom_violin(draw_quantiles = c(0.25, 0.5, 0.75), show.legend = F) + 
+  xlab('Tumour subtype') +
+  ylab('Normalized gene counts of LAG-3') +
+  theme_pubclean() + 
+    scale_y_continuous(trans = 'log10') +
+  scale_fill_manual(values =  c6) +
+  theme(text = element_text(size = 18))+
+  stat_compare_means(comparisons = my_comparisons,label = "p.signif")+
+ scale_x_discrete(labels = c('Unclassified','Luminal A','Luminal B','Non-luminal\nHER2+','Triple\nnegative')) 
+dev.off()
+```
+
+
+```{r}
+require(survival)
+require(survminer)
+
+options(na.action = 'na.omit')
+
+fit_by_types <- survfit(Surv( times, vital_status ) ~ subtype,
+               data = BRCA_survival )
+
+
+png('E:/Lorenzo/Final_TCGA/BRCA_data/BRCA_survival_by_cancer_types.png', width = 12000, height = 7000, res = 1120)
+ggsurvplot(fit_by_types, BRCA_survival ,
+                    palette = c6,
+                    legend.labs = c('Unclassified','Luminal A','Luminal B','Non-luminal HER2+', 'TNBC'),
+                    risk.table = T, 
+                    risk.table.height = 0.4,
+                    pval = TRUE, 
+                    pval.coord = c(1500, 0.5),
+                    xlim=c(0,2000), 
+                    ylim = c(0,1),
+                    break.x.by = 500,
+                   # title = c("CTL Clustering"),
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           legend.title ='Tumour classification',
+  ggtheme = theme_classic2(base_size=16, base_family = "Arial"),
+           font.family = "Arial")
+dev.off()
+
+```
+
+
+
+
+Now, lets save the data to csv for CIBERSORT analysis
+
+```{r}
+
+BRCA_norm_counts$Gene <- rownames(BRCA_norm_counts)
+BRCA_norm_counts <- BRCA_norm_counts %>% group_by(Gene) %>% filter(row_number() <= 1)
+BRCA_norm_counts <- BRCA_norm_counts[!is.na(BRCA_norm_counts$Gene),]
+# replace first col with gene symbol
+BRCA_norm_counts_export <- BRCA_norm_counts %>% as.data.frame(.)
+
+
+BRCA_norm_counts_export <-  cbind(BRCA_norm_counts_export$Gene, BRCA_norm_counts_export[,-ncol(BRCA_norm_counts_export)])
+names(BRCA_norm_counts_export)[1] <- 'Gene'
+
+#READ IN LM22 TO KNOW WHICH GENES WE NEED TO KEEP
+
+lm22 <- read.table('C:/Users/Standard User/Downloads/LM22.txt', header = T, sep = '\t')
+
+BRCA_norm_counts_export <- BRCA_norm_counts_export[BRCA_norm_counts_export$Gene %in% lm22$Gene.symbol,]
+
+
+write.table(BRCA_norm_counts_export,file = 'E:/Lorenzo/Final_TCGA/BRCA_norm_counts.txt',sep="\t",row.names=F, col.names = T)
+
+
+```
+
+Let's confirm that evyerthing thus far is working by plotting survival clustered by LAG3 and see if we get the same as last time
+
+```{r}
+require(survminer)
+require(survival)
+require(ClusterR)
+
+
+#add status to norm_counts data
+BRCA_LAG3_gene_counts$status <- clinical_BRCA$Status[match(BRCA_LAG3_gene_counts$submitter_id, clinical_BRCA$barcode)]
+
+
+LAG3_clusters <- Cluster_Medoids( center_scale( 
+      BRCA_LAG3_gene_counts %>% dplyr::select(all_of('LAG3_counts')) %>% as.matrix(.),mean_center = T, sd_scale = T ),clusters = 2, distance_metric = "manhattan",  swap_phase = T)
+BRCA_LAG3_gene_counts$clusters <- as.character(LAG3_clusters$clusters)
+
+BRCA_LAG3_gene_counts <-  BRCA_LAG3_gene_counts %>% 
+  mutate(clusters = ifelse(clusters == BRCA_LAG3_gene_counts %>% group_by(clusters) %>%summarize(mean_LAG3 = mean(LAG3_counts)) %>% .[.$mean_LAG3 ==max(.$mean_LAG3),] %>% dplyr::select('clusters') %>% .$'clusters', 'LAG3 high', 'LAG3 low'))
+
+
+
+BRCA_survival$LAG3_cluster <- BRCA_LAG3_gene_counts[match(BRCA_survival$barcode, BRCA_LAG3_gene_counts$submitter_id),]$clusters
+
+fit_by_LAG3_cluster <- survfit(Surv( times, vital_status ) ~ LAG3_cluster,
+               data = BRCA_survival )
+
+png('E:/Lorenzo/Final_TCGA/COAD_data/BRCA_survival_by_LAG3.png', width = 9600, height = 5600, res = 1120)
+ggsurvplot(fit_by_LAG3_cluster, BRCA_survival,
+                    #legend.labs = c("Other", "TripleNegative"),
+                    palette = c("red", "gold"),
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(3500, 0.9),
+                    ggtheme = theme_survminer(),
+                    xlim=c(0,5000), 
+                    break.x.by = 1000,
+                   # title = c("CTL Clustering"),
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           legend.title ='LAG3 cluster',
+           legend.labs = c("LAG3 High", "LAG3 Low"))
+dev.off()
+```
+
+
+# Now lets look only at TNBC samples and cluster those into LAG3 hi or low
+
+```{r}
+
+TNBC_samples <- BRCA_LAG3_gene_counts %>% filter(subtype =='Triple negative')
+TNBC_survival <- BRCA_survival %>% filter(subtype =='Triple negative')
+
+
+TNBC_survival$LAG3_cluster <- ntile(TNBC_samples$LAG3_counts, 100)
+
+TNBC_survival <- TNBC_survival %>% 
+  mutate(LAG3_cluster = case_when(LAG3_cluster <= 50 ~ "LAG3 low",
+                        LAG3_cluster > 50  ~ "LAG3 high"))
+
+
+TNBC_fit_by_LAG3_cluster <- survfit(Surv( times, vital_status ) ~ LAG3_cluster,
+               data = TNBC_survival )
+
+png('E:/Lorenzo/Final_TCGA/BRCA_data/TNBC_survival_by_LAG3.png', width = 9600, height = 5600, res = 1120)
+ggsurvplot(TNBC_fit_by_LAG3_cluster, TNBC_survival,
+                    #legend.labs = c("Other", "TripleNegative"),
+                    palette = c("red", "gold"),
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(3000, 1),
+                    ggtheme = theme_survminer(),
+                    xlim=c(0,4000), 
+                    break.x.by = 800,
+                   # title = c("CTL Clustering"),
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           legend.title ='LAG3 cluster',
+           legend.labs = c("LAG3 High", "LAG3 Low"))
+dev.off()
+```
+
+
+
+# FGL1 analysis
+
+```{r}
+require(survminer)
+require(survival)
+
+
+  BRCA_FGL1_gene_counts <- BRCA_norm_counts %>% as.data.frame(.) %>% filter(Gene == 'FGL1')  %>% dplyr::select(-Gene) %>%  pivot_longer(cols = everything(), names_to = 'submitter_id', values_to =  'gene_count')
+
+
+#add status to norm_counts data
+
+BRCA_FGL1_gene_counts$subtype <- clinical_BRCA$subtype[match(BRCA_FGL1_gene_counts$submitter_id, clinical_BRCA$barcode)]
+
+BRCA_FGL1_gene_counts$FGL1_group <- ntile(BRCA_FGL1_gene_counts$gene_count, 4)  
+BRCA_FGL1_gene_counts <- BRCA_FGL1_gene_counts %>%                              
+  mutate(FGL1_group = replace(FGL1_group, FGL1_group == 1, 'Q1'))  %>%                              
+  mutate(FGL1_group = replace(FGL1_group, FGL1_group == 2, 'Q2')) %>%                              
+  mutate(FGL1_group = replace(FGL1_group, FGL1_group == 3, 'Q3')) %>%                              
+  mutate(FGL1_group = replace(FGL1_group, FGL1_group == 4, 'Q4')) 
+
+BRCA_survival$FGL1_cluster <- BRCA_FGL1_gene_counts[match(BRCA_survival$barcode, BRCA_FGL1_gene_counts$submitter_id),]$FGL1_group
+
+fit_by_FGL1_cluster <- survfit(Surv( times, vital_status ) ~ FGL1_cluster,
+               data = BRCA_survival )
+
+png('E:/Lorenzo/Final_TCGA/BRCA_data/BRCA_survival_by_FGL1.png', width = 9600, height = 6500, res = 1120)
+ggsurvplot(fit_by_FGL1_cluster, BRCA_survival,
+                    #legend.labs = c("Other", "TripleNegative"),
+                    #palette = c("red", "cornflowerblue"),
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(3500, 0.9),
+                    ggtheme = theme_survminer(),
+                    xlim=c(0,5000), 
+                    break.x.by = 1000,
+                   # title = c("CTL Clustering"),
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           legend.title ='FGL1 quasrtile',
+           legend.labs = c('Q1','Q2','Q3','Q4'))
+dev.off()
+
+
+
+```
+
+# lET'S LOOK AT FGL1 EXPRESSION IN TNBC TUMOURS
+
+```{r}
+
+
+TNBC_samples <- BRCA_FGL1_gene_counts %>% filter(subtype =='Triple negative')
+TNBC_samples$FGL1_group <- ntile(TNBC_samples$gene_count, 2)  
+
+TNBC_samples <- TNBC_samples %>%                              
+  mutate(FGL1_group = replace(FGL1_group, FGL1_group == 1, 'Lower half'))  %>%                              
+  mutate(FGL1_group = replace(FGL1_group, FGL1_group == 2, 'Upper half'))  
+
+
+TNBC_survival$FGL1_group <- TNBC_samples[match(TNBC_survival$barcode, TNBC_samples$submitter_id),]$FGL1_group
+
+
+TNBC_fit_by_FGL1_group <- survfit(Surv( times, vital_status ) ~ FGL1_group,
+               data = TNBC_survival )
+
+ 
+ggsurvplot(TNBC_fit_by_FGL1_group, TNBC_survival,
+                    #legend.labs = c("Other", "TripleNegative"),
+                   # palette = c("red", "cornflowerblue"),
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(3000, 1),
+                    ggtheme = theme_survminer(),
+                    xlim=c(0,4000), 
+                    break.x.by = 800,
+                   # title = c("CTL Clustering"),
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           legend.title ='FGL1 group',
+           legend.labs = c('Lower half','Upper half'))
+
+```
+# Now let's replicate the CIBERSORT analysis
+# Previously, we had seen the in TCGA BRCA CTL hi meant better survival
+
+
+```{r}
+BRCA_CBSRT <- read.csv('C:/Users/Standard User/Downloads/CIBERSORTx_Job5_Results.csv')
+
+# match the BRCA survival to the number of cell types for each sample
+
+BRCA_survival[,18:39] <-  BRCA_CBSRT[match(BRCA_survival$barcode, BRCA_CBSRT$Mixture),][,2:23]
+
+
+
+BRCA_survival %>% pivot_longer(cols = !c(1:18), names_to = 'Cell_type',values_to = 'percentage') %>% .[!is.na(.$percentage),]  %>% split(., f = .$Cell_type) %>% lapply(., function(x) {
+  cell_type_cluster <- Cluster_Medoids( center_scale( 
+      x %>% dplyr::select(all_of('percentage')) %>% as.matrix(.),mean_center = T, sd_scale = T ),clusters = 2, distance_metric = "manhattan",  swap_phase = T)
+  x$cell_type_cluster <- as.character(cell_type_cluster$clusters)
+  x_summarized <- x %>%
+    group_by(cell_type_cluster) %>%
+    dplyr::summarize(Mean_percentage = mean(percentage, na.rm=TRUE))
+  if ( x_summarized$Mean_percentage[1] > x_summarized$Mean_percentage[2]) {
+    x <- x %>%                              
+  mutate(cell_type_cluster = replace(cell_type_cluster, cell_type_cluster == 1, 'High'))  %>%                              
+  mutate(cell_type_cluster = replace(cell_type_cluster, cell_type_cluster == 2, 'Low')) 
+  }
+  else {
+        x <- x %>%                              
+  mutate(cell_type_cluster = replace(cell_type_cluster, cell_type_cluster == 1, 'Low'))  %>%                              
+  mutate(cell_type_cluster = replace(cell_type_cluster, cell_type_cluster == 2, 'High')) 
+
+    
+  }
+    cell_type <- gsub('\\.', ' ', unique(x$Cell_type))
+  
+  fit_by_cell_type_cluster <- survfit(Surv( times, vital_status ) ~ cell_type_cluster,
+                 data = x )
+
+  plot <- ggsurvplot(fit_by_cell_type_cluster, x,
+                    #legend.labs = c("Other", "TripleNegative"),
+                    palette = c("red", "cornflowerblue"),
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(1500, 0.5),
+                    ggtheme = theme_survminer(),
+                    xlim=c(0,3000), 
+                    break.x.by = 1000,
+                   title = paste('All samples -', cell_type),
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           legend.title = cell_type,
+           legend.labs = c('High cluster','Low cluster'))
+  path = paste(paste('E:/Lorenzo/Final_TCGA/BRCA_surv_plots/All/', cell_type, sep=''), '.pdf', sep='')
+  pdf(path)
+  print(plot, newpage = FALSE)
+  dev.off()
+
+})
+
+
+```
+
+# okay great looking good - lets repeat the plotting but only with TNBC
+```{r}
+BRCA_survival %>% filter(subtype == 'Triple negative') %>% pivot_longer(cols = !c(1:18), names_to = 'Cell_type',values_to = 'percentage')  %>% .[!is.na(.$percentage),]  %>% split(., f = .$Cell_type) %>% lapply(., function(x) {
+   if(max(x$percentage) != 0) {
+  cell_type_cluster <- Cluster_Medoids( center_scale( 
+      x %>% dplyr::select(all_of('percentage')) %>% as.matrix(.),mean_center = T, sd_scale = T ),clusters = 2, distance_metric = "manhattan",  swap_phase = T)
+  x$cell_type_cluster <- as.character(cell_type_cluster$clusters)
+  x_summarized <- x %>%
+    group_by(cell_type_cluster) %>%
+    dplyr::summarize(Mean_percentage = mean(percentage, na.rm=TRUE))
+  if ( x_summarized$Mean_percentage[1] > x_summarized$Mean_percentage[2]) {
+    x <- x %>%                              
+  mutate(cell_type_cluster = replace(cell_type_cluster, cell_type_cluster == 1, 'High'))  %>%                              
+  mutate(cell_type_cluster = replace(cell_type_cluster, cell_type_cluster == 2, 'Low')) 
+  } else {
+        x <- x %>%                              
+  mutate(cell_type_cluster = replace(cell_type_cluster, cell_type_cluster == 1, 'Low'))  %>%                              
+  mutate(cell_type_cluster = replace(cell_type_cluster, cell_type_cluster == 2, 'High')) 
+
+    
+  }
+    cell_type <- gsub('\\.', ' ', unique(x$Cell_type))
+  
+  fit_by_cell_type_cluster <- survfit(Surv( times, vital_status ) ~ cell_type_cluster,
+                 data = x )
+  plot <- ggsurvplot(fit_by_cell_type_cluster, x,
+                    palette = c("red", "cornflowerblue"),
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(1500, 0.5),
+                    ggtheme = theme_survminer(),
+                    xlim=c(0,3000), 
+                    break.x.by = 1000,
+                   title = paste('TNBC -', cell_type),
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           legend.title = cell_type,
+           legend.labs = c('High cluster','Low cluster'))
+  path = paste(paste('E:/Lorenzo/Final_TCGA/BRCA_surv_plots/TNBC', cell_type, sep=''), '.pdf', sep='')
+  pdf(path)
+  print(plot, newpage = FALSE)
+  dev.off()
+   }
+  })
+```
+
+# Finally to plot survival with CD8 hi and LAG3 clustering for all samplse and then TNBC samples
+
+
+```{r, fig.width=8, fig.height=8}
+BRCA_LAG3_gene_counts$T.cell.CD8 <- BRCA_CBSRT[match(BRCA_LAG3_gene_counts$submitter_id, BRCA_CBSRT$Mixture),]$T.cells.CD8
+BRCA_LAG3_gene_counts$clusters <- NULL
+BRCA_LAG3_gene_counts$CD8_cluster <- NULL
+BRCA_LAG3_gene_counts$status <- NULL
+colnames(BRCA_LAG3_gene_counts)[2] <- 'LAG3'
+BRCA_LAG3_gene_counts$LAG3_cluster <- 'LAG3'
+
+
+BRCA_LAG3_gene_counts <- BRCA_LAG3_gene_counts[!is.na(BRCA_LAG3_gene_counts$T.cell.CD8),]
+
+cluster_data <- Cluster_Medoids(center_scale( as.matrix(BRCA_LAG3_gene_counts %>% dplyr::select(all_of('T.cell.CD8'))), 
+                                              mean_center = T, sd_scale = T ),
+                                clusters = 2, 
+                                distance_metric = "manhattan", 
+                                swap_phase = T, 
+                                seed = 123)
+    
+BRCA_LAG3_gene_counts <- BRCA_LAG3_gene_counts %>% mutate("CTL_cluster"= (cluster_data$clusters %>% as.character))
+    
+clust_1_mean <- mean(as.list(BRCA_LAG3_gene_counts[BRCA_LAG3_gene_counts$CTL_cluster == 1,] %>% dplyr::select(all_of('T.cell.CD8')))[[1]])
+clust_2_mean <- mean(as.list(BRCA_LAG3_gene_counts[BRCA_LAG3_gene_counts$CTL_cluster == 2,] %>% dplyr::select(all_of('T.cell.CD8')))[[1]])
+
+clust_1_status <- ifelse(clust_1_mean > clust_2_mean, "CTL High", "CTL Low")
+clust_2_status <- ifelse(clust_2_mean > clust_1_mean, "CTL High", "CTL Low")
+
+BRCA_LAG3_gene_counts[BRCA_LAG3_gene_counts$CTL_cluster == 1,]$CTL_cluster <- clust_1_status
+BRCA_LAG3_gene_counts[BRCA_LAG3_gene_counts$CTL_cluster == 2,]$CTL_cluster <- clust_2_status
+
+BRCA_survival <- BRCA_survival[BRCA_survival$barcode %in% BRCA_CBSRT$Mixture,]
+BRCA_CBSRT <- BRCA_CBSRT[BRCA_CBSRT$Mixture %in% BRCA_survival$barcode,]
+
+
+#Second level of clustering
+cluster_data <- Cluster_Medoids(center_scale( as.matrix(BRCA_LAG3_gene_counts %>% dplyr::select(all_of('LAG3'))), 
+                                              mean_center = T, sd_scale = T ),
+                                clusters = 2, 
+                                distance_metric = "manhattan", 
+                                swap_phase = T, 
+                                seed = 123)
+BRCA_LAG3_gene_counts <- BRCA_LAG3_gene_counts %>% mutate("LAG3_cluster"= (cluster_data$clusters %>% as.character))
+
+ clust_1_mean <- mean(as.list(BRCA_LAG3_gene_counts[BRCA_LAG3_gene_counts$LAG3_cluster == 1,] %>% dplyr::select(all_of('LAG3')))[[1]])
+clust_2_mean <- mean(as.list(BRCA_LAG3_gene_counts[BRCA_LAG3_gene_counts$LAG3_cluster == 2,] %>% dplyr::select(all_of('LAG3')))[[1]])
+
+clust_1_status <- ifelse(clust_1_mean > clust_2_mean, "LAG3 High", "LAG3 Low")
+clust_2_status <- ifelse(clust_2_mean > clust_1_mean, "LAG3 High", "LAG3 Low")
+
+BRCA_LAG3_gene_counts[BRCA_LAG3_gene_counts$LAG3_cluster == 1,]$LAG3_cluster <- clust_1_status
+BRCA_LAG3_gene_counts[BRCA_LAG3_gene_counts$LAG3_cluster == 2,]$LAG3_cluster <- clust_2_status
+
+BRCA_survival$LAG3_cluster <- BRCA_LAG3_gene_counts[match(BRCA_survival$barcode, BRCA_LAG3_gene_counts$submitter_id),]$LAG3_cluster
+BRCA_survival$CTL_cluster <- BRCA_LAG3_gene_counts[match(BRCA_survival$barcode, BRCA_LAG3_gene_counts$submitter_id),]$CTL_cluster
+
+
+fit_CD8hi_LAG3_cluster <- survfit(Surv( times, vital_status ) ~ LAG3_cluster,
+                 data = BRCA_survival[BRCA_survival$CTL_cluster == 'CTL High',] )
+
+png('E:/Lorenzo/Final_TCGA/BRCA_data/CD8high_survival_by_LAG3.png', width = 8000, height = 7000, res = 1000)
+ggsurvplot(fit_CD8hi_LAG3_cluster,
+                    palette = c("red4", "red1"),
+                    legend.labs = c('CD8 T cell high\nLAG3 high','CD8 T cell high\nLAG3 low'),
+           legend.title ='CD8 T cell and LAG3\nexpression group',
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(1500, 0.4),
+           ggtheme = theme_classic2(base_size=16, base_family = "Arial"),
+           font.family = "Arial",
+                    xlim=c(0,2500), 
+                    break.x.by = 500,
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           title = 'CD8+ high - clustered by LAG3')
+          # legend.title = cell_type,
+dev.off()
+
+
+fit_CD8low_LAG3_cluster <- survfit(Surv( times, vital_status ) ~ LAG3_cluster,
+                 data = BRCA_survival[BRCA_survival$CTL_cluster == 'CTL Low',] )
+
+png('E:/Lorenzo/Final_TCGA/BRCA_data/CD8low_survival_by_LAG3.png', width = 8000, height = 7000, res = 1000)
+ggsurvplot(fit_CD8low_LAG3_cluster,
+                    palette = c("red4", "red1"),
+                    legend.labs = c('CD8 T cell low\nLAG3 high','CD8 T cell low\nLAG3 low'),
+           legend.title ='CD8 T cell and LAG3\nexpression group',
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(1500, 0.4),
+           ggtheme = theme_classic2(base_size=16, base_family = "Arial"),
+           font.family = "Arial",
+                    xlim=c(0,2500), 
+                    break.x.by = 500,
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           title = 'CD8+ low - clustered by LAG3')
+          # legend.title = cell_type,
+dev.off()
+
+
+
+```
+
+
+# Also replot COAD with Treg hi and look at LAG3 clustering effect on survival
+
+
+```{r}
+BRCA_LAG3_gene_counts$T.cells.regulatory..Tregs. <- BRCA_CBSRT[match(BRCA_LAG3_gene_counts$submitter_id, BRCA_CBSRT$Mixture),]$T.cells.regulatory..Tregs.
+BRCA_LAG3_gene_counts$clusters <- NULL
+BRCA_LAG3_gene_counts$Treg_cluster <- NULL 
+BRCA_LAG3_gene_counts$status <- NULL
+BRCA_LAG3_gene_counts$LAG3_cluster <- 'LAG3'
+
+
+BRCA_LAG3_gene_counts <- BRCA_LAG3_gene_counts[!is.na(BRCA_LAG3_gene_counts$T.cells.regulatory..Tregs.),]
+
+cluster_data <- Cluster_Medoids(center_scale( as.matrix(BRCA_LAG3_gene_counts %>% dplyr::select(all_of('T.cells.regulatory..Tregs.'))), 
+                                              mean_center = T, sd_scale = T ),
+                                clusters = 2, 
+                                distance_metric = "manhattan", 
+                                swap_phase = T, 
+                                seed = 123)
+    
+BRCA_LAG3_gene_counts <- BRCA_LAG3_gene_counts %>% mutate("Treg_cluster"= (cluster_data$clusters %>% as.character))
+    
+clust_1_mean <- mean(as.list(BRCA_LAG3_gene_counts[BRCA_LAG3_gene_counts$Treg_cluster == 1,] %>% dplyr::select(all_of('T.cells.regulatory..Tregs.')))[[1]])
+clust_2_mean <- mean(as.list(BRCA_LAG3_gene_counts[BRCA_LAG3_gene_counts$Treg_cluster == 2,] %>% dplyr::select(all_of('T.cells.regulatory..Tregs.')))[[1]])
+
+clust_1_status <- ifelse(clust_1_mean > clust_2_mean, "Treg High", "Treg Low")
+clust_2_status <- ifelse(clust_2_mean > clust_1_mean, "Treg High", "Treg Low")
+
+BRCA_LAG3_gene_counts[BRCA_LAG3_gene_counts$Treg_cluster == 1,]$Treg_cluster <- clust_1_status
+BRCA_LAG3_gene_counts[BRCA_LAG3_gene_counts$Treg_cluster == 2,]$Treg_cluster <- clust_2_status
+
+
+#Second level of clustering
+cluster_data <- Cluster_Medoids(center_scale( as.matrix(BRCA_LAG3_gene_counts %>% dplyr::select(all_of('LAG3'))), 
+                                              mean_center = T, sd_scale = T ),
+                                clusters = 2, 
+                                distance_metric = "manhattan", 
+                                swap_phase = T, 
+                                seed = 123)
+BRCA_LAG3_gene_counts <- BRCA_LAG3_gene_counts %>% mutate("LAG3_cluster"= (cluster_data$clusters %>% as.character))
+
+ clust_1_mean <- mean(as.list(BRCA_LAG3_gene_counts[BRCA_LAG3_gene_counts$LAG3_cluster == 1,] %>% dplyr::select(all_of('LAG3')))[[1]])
+clust_2_mean <- mean(as.list(BRCA_LAG3_gene_counts[BRCA_LAG3_gene_counts$LAG3_cluster == 2,] %>% dplyr::select(all_of('LAG3')))[[1]])
+
+clust_1_status <- ifelse(clust_1_mean > clust_2_mean, "LAG3 High", "LAG3 Low")
+clust_2_status <- ifelse(clust_2_mean > clust_1_mean, "LAG3 High", "LAG3 Low")
+
+BRCA_LAG3_gene_counts[BRCA_LAG3_gene_counts$LAG3_cluster == 1,]$LAG3_cluster <- clust_1_status
+BRCA_LAG3_gene_counts[BRCA_LAG3_gene_counts$LAG3_cluster == 2,]$LAG3_cluster <- clust_2_status
+
+BRCA_survival$LAG3_cluster <- BRCA_LAG3_gene_counts[match(BRCA_survival$barcode, BRCA_LAG3_gene_counts$submitter_id),]$LAG3_cluster
+BRCA_survival$Treg_cluster <- BRCA_LAG3_gene_counts[match(BRCA_survival$barcode, BRCA_LAG3_gene_counts$submitter_id),]$Treg_cluster
+
+
+fit_Treghi_LAG3_cluster <- survfit(Surv( times, vital_status ) ~ LAG3_cluster,
+                 data = BRCA_survival[BRCA_survival$Treg_cluster == 'Treg High',] )
+
+png('E:/Lorenzo/Final_TCGA/BRCA_data/Treghigh_survival_by_LAG3.png', width = 8000, height = 7000, res = 1000)
+ggsurvplot(fit_Treghi_LAG3_cluster,
+                    palette = c("red4", "red1"),
+                    legend.labs = c('Treg T cell high\nLAG3 high','Treg T cell high\nLAG3 low'),
+           legend.title ='Treg T cell and LAG3\nexpression group',
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(1500, 0.4),
+           ggtheme = theme_classic2(base_size=16, base_family = "Arial"),
+           font.family = "Arial",
+                    xlim=c(0,2500), 
+                    break.x.by = 500,
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           title = 'Treg+ high - clustered by LAG3')
+          # legend.title = cell_type,
+dev.off()
+
+
+fit_Treglow_LAG3_cluster <- survfit(Surv( times, vital_status ) ~ LAG3_cluster,
+                 data = BRCA_survival[BRCA_survival$Treg_cluster == 'Treg Low',] )
+
+png('E:/Lorenzo/Final_TCGA/BRCA_data/Treglow_survival_by_LAG3.png', width = 8000, height = 7000, res = 1000)
+ggsurvplot(fit_Treglow_LAG3_cluster,
+                    palette = c("red4", "red1"),
+                    legend.labs = c('Treg T cell low\nLAG3 high','Treg T cell low\nLAG3 low'),
+           legend.title ='Treg T cell and LAG3\nexpression group',
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(1500, 0.4),
+           ggtheme = theme_classic2(base_size=16, base_family = "Arial"),
+           font.family = "Arial",
+                    xlim=c(0,2500), 
+                    break.x.by = 500,
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2,
+           title = 'Treg+ low - clustered by LAG3')
+          # legend.title = cell_type,
+dev.off()
+
+
+
+
+```
+
+
+
+GSVA of CD8high LAG3 high vs CD8 high LAG3 low 
+
+```{r}
+library(GSVA)
+
+gage_dataset_BRCA <- BRCA_norm_counts 
+gage_dataset_BRCA <- gage_dataset_BRCA[!duplicated(gage_dataset_BRCA$Gene),]
+gage_dataset_BRCA <- gage_dataset_BRCA[!is.na(gage_dataset_BRCA$Gene),] %>% as.data.frame(.)
+rownames(gage_dataset_BRCA) <- gage_dataset_BRCA$Gene
+gage_dataset_BRCA$Gene <- NULL
+gage_dataset_BRCA <- as.matrix(gage_dataset_BRCA)
+
+library(qusage)
+# Reactome Pathway Analysis
+all_paths_gmt <- read.gmt("E:/Lorenzo/Final_TCGA/ReactomePathways.gmt") %>% map(function(x){ x[-1]} ) # Removes the first entry of each 
+gmt_df <- tibble("Pathway"=map(all_paths_gmt, unlist)%>%names(), "Genes"=map(all_paths_gmt, unlist) )
+#makes a tibble with reactome gene names and gene lists
+library(magrittr)
+all_paths <- read.table("E:/Lorenzo/Final_TCGA/ReactomePathways.txt", sep = "\t", header = F) %>% 
+  as_tibble() %>%
+  filter({grepl("HSA", (.)$V1)}) %>% 
+  filter({grepl("Homo sapiens", (.)$V3)}) %>% 
+  set_colnames(c("Code", "Pathway", "Species") ) %>%
+  left_join(gmt_df, by="Pathway") %>%
+  add_column("Number"=map_dbl((.)$Genes, length)) %>% 
+  dplyr::arrange(desc(Number))
+
+
+all_paths_list <- all_paths %>% filter(Number>10) %>% 
+  filter(Number<1000) %>% pull(Genes)
+names(all_paths_list) <- all_paths %>% filter(Number>10) %>% 
+  filter(Number<1000) %>% pull(Pathway)
+
+
+#Subset dataset to BRCA patients by colnames that are equal to rownames of CBSRT df where project ID = TCGA-BRCA
+
+library(GSVA)
+gsva_lag3hi_vs_lag3low_BRCA <- gsva(gage_dataset_BRCA, 
+     all_paths_list, 
+     method=c("gsva"), 
+     kcdf=c("Gaussian"),
+     min.sz=10,
+     max.sz=500,
+     mx.diff=F,
+     verbose = T)
+
+#Make tibble with patient ID and LAG3 expression group
+patient_code_BRCA <- BRCA_survival %>% dplyr::select(CTL_cluster, LAG3_cluster) %>% as.data.frame(.)
+rownames(patient_code_BRCA) <- BRCA_survival$barcode
+
+## Fit the same linear model now to the GSVA enrichment scores 
+ctl <- factor(patient_code_BRCA$CTL_cluster)
+lag3 <- factor(patient_code_BRCA$LAG3_cluster)
+design <- model.matrix(~0+ctl:lag3)
+colnames(design) <- c("CTLhi_LAG3hi", "CTLlow_LAG3hi", "CTLhi_LAG3low","CTLlow_LAG3low")
+
+options(na.action="na.pass")
+
+fit_gsva_BRCA <- lmFit(gsva_lag3hi_vs_lag3low_BRCA, design=design)
+## Define contrasts
+contrast.matrix <- makeContrasts(CTLhi_LAG3hi-CTLhi_LAG3low, levels = design)
+fit2_gsva_BRCA <- contrasts.fit(fit_gsva_BRCA, contrast.matrix)
+## estimate moderated t-statistics 
+fit2_gsva_BRCA <- eBayes(fit2_gsva_BRCA)
+
+BRCA_CTLhigh_top_genes <- topTable(fit2_gsva_BRCA, adjust = "BH", number = 1000)
+BRCA_CTLhigh_top_genes <- BRCA_CTLhigh_top_genes[order(BRCA_CTLhigh_top_genes$logFC, decreasing = T),]
+BRCA_CTLhigh_top_genes
+
+
+```
+
+
+
+
+Combined analysis of COAD and BRCA
+This requires to have loaded in the COAD and BRCA datasets
+
+```{r}
+
+#redefine the BRCA samples of interest
+my_sample_col <- BRCA_survival %>% filter(CTL_cluster == 'CTL High') %>% dplyr::select(barcode, LAG3_cluster) %>% as.data.frame(.)
+rownames(my_sample_col) <- my_sample_col$barcode
+my_sample_col$barcode <- NULL
+names(my_sample_col) <- 'LAG3 expression cluster'
+
+# using the top perturbed pathways from COAD
+
+top10_gene_pathways <- rownames(head(COAD_CTLhigh_top_genes,10))
+mhc_pathways_indicies <- grep('MHC class II', 
+                     rownames(topTable(fit2_gsva_coad,coef=1,  adjust = "BH", number = 700)))
+                          
+mhc_pathways <- rownames(topTable(fit2_gsva_coad,coef=1,  adjust = "BH", number = 700))[mhc_pathways_indicies]                
+top10_gene_pathways <- c(mhc_pathways, top10_gene_pathways)                   
+
+
+top10 <- data.frame(COAD = COAD_CTLhigh_top_genes[rownames(COAD_CTLhigh_top_genes) %in% top10_gene_pathways,]$logFC,
+           BRCA =  BRCA_CTLhigh_top_genes[rownames(BRCA_CTLhigh_top_genes) %in% top10_gene_pathways,]$logFC)
+rownames(top10) <- top10_gene_pathways
+
+require(pheatmap)
+png('E:/Lorenzo/Final_TCGA/COAD_vs_BRCA_GSVA_heatmap.png', width = 8000, height = 7000, res = 1000)
+pheatmap(top10,
+         show_rownames = T,
+         show_colnames = T,
+         cluster_cols = F,
+         cluster_rows = T,
+         clustering_distance_cols ='manhattan',
+         clustering_method = "ward.D2", 
+         cutree_cols = 0, 
+         treeheight_col = 0) 
+dev.off()
+
+
+```
+
+
+
+Now we plot the amount of MHC-II expressing cell types in LAG-3 high vs LAG-3 low
+```{r, fig.width=12, fig.height=6}
+COAD_CBSRT$LAG3_cluster <- COAD_survival[match(COAD_survival$barcode, COAD_CBSRT$Mixture),]$LAG3_cluster
+BRCA_CBSRT$LAG3_cluster <- BRCA_survival[match(BRCA_survival$barcode, BRCA_CBSRT$Mixture),]$LAG3_cluster
+
+
+png('E:/Lorenzo/Final_TCGA/MHC_II_cell_types.png', width = 11000, height = 5600, res = 1120)
+rbind(
+  COAD_CBSRT %>% dplyr::select(Mixture, LAG3_cluster, B.cells.naive, B.cells.memory, 
+                             Plasma.cells,Monocytes, Macrophages.M0, 
+                             Macrophages.M1, Macrophages.M2, Dendritic.cells.resting, Dendritic.cells.activated) %>%
+  pivot_longer(cols = !c(Mixture, LAG3_cluster), names_to = 'Population', values_to = 'Percentage') %>%
+  mutate(Project = 'COAD'), 
+BRCA_CBSRT %>% dplyr::select(Mixture, LAG3_cluster, B.cells.naive, B.cells.memory, 
+                             Plasma.cells,Monocytes, Macrophages.M0, 
+                             Macrophages.M1, Macrophages.M2, Dendritic.cells.resting, Dendritic.cells.activated) %>%
+  pivot_longer(cols = !c(Mixture, LAG3_cluster), names_to = 'Population', values_to = 'Percentage') %>%
+  mutate(Project = 'BRCA')
+) %>% group_by(Mixture) %>% summarize(LAG3_cluster = LAG3_cluster,
+                                      Population = Population,
+                                      Percentage = Percentage/sum(Percentage),
+                                      Project = Project) %>%
+  mutate(Population = gsub('\\.', ' ', Population)) %>%
+  ggplot(., aes( x= interaction(Population,LAG3_cluster), 
+                 y = Percentage)) +
+  geom_boxplot(aes(fill = LAG3_cluster)) +
+  facet_wrap(~Project, ncol = 1) + 
+  scale_x_discrete(limits = c('B cells naive.LAG3 High','B cells naive.LAG3 Low',
+                              'B cells memory.LAG3 High','B cells memory.LAG3 Low',
+                              'Plasma cells.LAG3 High','Plasma cells.LAG3 Low',
+                              'Monocytes.LAG3 High','Monocytes.LAG3 Low',
+                              'Macrophages M0.LAG3 High','Macrophages M0.LAG3 Low',
+                              'Macrophages M1.LAG3 High','Macrophages M1.LAG3 Low',
+                              'Macrophages M2.LAG3 High','Macrophages M2.LAG3 Low',
+                              'Dendritic cells resting.LAG3 High','Dendritic cells resting.LAG3 Low',
+                              'Dendritic cells activated.LAG3 High','Dendritic cells activated.LAG3 Low'),
+                   labels = c('', 'B cells naive', '', 'B cells memory',
+                              '', 'Plasma cells','','Monocytes','',
+                              'Macrophages\nM0','', 'Macrophages\nM1','',
+                              'Macrophages\nM2','','Dendritic cells\nresting','','Dendritic cells\nactivated')) +
+  theme_pubclean() +
+  theme(axis.text.x = element_text(hjust=0.8)) +
+  stat_compare_means(
+    comparisons = list(
+      c('B cells naive.LAG3 High','B cells naive.LAG3 Low'),
+      c('B cells memory.LAG3 High','B cells memory.LAG3 Low'),
+      c('Plasma cells.LAG3 High','Plasma cells.LAG3 Low'),
+      c('Monocytes.LAG3 High','Monocytes.LAG3 Low'),
+      c('Macrophages M0.LAG3 High','Macrophages M0.LAG3 Low'),
+      c('Macrophages M1.LAG3 High','Macrophages M1.LAG3 Low'),
+      c('Macrophages M2.LAG3 High','Macrophages M2.LAG3 Low'),
+      c('Dendritic cells resting.LAG3 High','Dendritic cells resting.LAG3 Low'),
+      c('Dendritic cells activated.LAG3 High','Dendritic cells activated.LAG3 Low')), label.y = 1
+    ) +
+  scale_y_continuous(expand = c(0,0.1)) +
+  xlab('Cell type') +
+  ylab('Percentage abundance in sample') +
+  theme(legend.position = "bottom") +
+  scale_fill_manual(name = 'LAG3 expression cluster', values = c('red','goldenrod1'), labels = c('LAG3 High','LAG3 low'))
+dev.off()
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+HLADRA_gene_counts <- rbind(
+  COAD_norm_counts[COAD_norm_counts$Gene == 'HLA-DRA',] %>% 
+  pivot_longer(cols = !Gene, names_to ='Mixture',values_to = 'HLADRA') %>%
+  mutate(Project ='COAD'),
+BRCA_norm_counts[BRCA_norm_counts$Gene == 'HLA-DRA',] %>% 
+  pivot_longer(cols = !Gene, names_to ='Mixture',values_to = 'HLADRA') %>%
+  mutate(Project ='BRCA')
+)
+
+macrophage_counts <- rbind(
+  COAD_CBSRT %>% dplyr::select(Mixture, LAG3_cluster, B.cells.naive, B.cells.memory, 
+                             Plasma.cells,Monocytes, Macrophages.M0, 
+                             Macrophages.M1, Macrophages.M2, Dendritic.cells.resting, Dendritic.cells.activated) %>%
+  pivot_longer(cols = !c(Mixture, LAG3_cluster), names_to = 'Population', values_to = 'Percentage') %>%
+  mutate(Project = 'COAD'), 
+BRCA_CBSRT %>% dplyr::select(Mixture, LAG3_cluster, B.cells.naive, B.cells.memory, 
+                             Plasma.cells,Monocytes, Macrophages.M0, 
+                             Macrophages.M1, Macrophages.M2, Dendritic.cells.resting, Dendritic.cells.activated) %>%
+  pivot_longer(cols = !c(Mixture, LAG3_cluster), names_to = 'Population', values_to = 'Percentage') %>%
+  mutate(Project = 'BRCA')
+)  %>%
+  group_by(Mixture) %>% summarize(LAG3_cluster = LAG3_cluster,
+                                      Percentage = sum(Percentage),
+                                      Project = Project) %>% distinct(.)
+
+
+
+HLADRA_gene_counts$Gene <- NULL
+HLADRA_gene_counts$Project <- NULL
+
+require(ggpmisc)
+
+png('E:/Lorenzo/Final_TCGA/HLADRA_vs_APCs.png', width = 11000, height = 5600, res = 1120)
+merge(HLADRA_gene_counts, macrophage_counts, by = 'Mixture') %>%
+  ggplot(., aes( x = log10(Percentage),
+                 y = log10(HLADRA),
+                 color = LAG3_cluster)) +
+  geom_smooth(method = 'lm', show.legend = F) +
+  geom_point() +
+  facet_wrap(~Project, scales = 'free') +
+ # scale_x_continuous(limits = c(0, 1)) +
+  scale_y_continuous(labels = scales::comma)  +
+  stat_poly_line() +
+  stat_poly_eq(aes(label = paste(..rr.label.., ..p.value.label.., sep = "*`,`~")))  +
+  geom_smooth(method = "lm", se = FALSE) +
+  ylab('log10(Normalised gene counts of HLA-DRA)') +
+  xlab('log10(Abundance of APCs)') +
+  theme_pubclean() +
+  scale_color_manual(name = 'LAG3 expression cluster', values = c('brown3','darkgoldenrod1'), labels = c('LAG3 High','LAG3 Low')) +
+  theme(legend.position = 'bottom')
+dev.off()
+ 
+combined_data_model <- merge(HLADRA_gene_counts, macrophage_counts, by = 'Mixture') 
+
+model <- lm(HLADRA ~ Percentage*LAG3_cluster*Project, data = combined_data_model)
+
+png('E:/Lorenzo/Final_TCGA/original_residual_variance.png', width = 5000, height = 4000, res = 1000)
+plot(model, c(1))
+dev.off()
+png('E:/Lorenzo/Final_TCGA/original_residual_normality.png', width = 5000, height = 4000, res = 1000)
+plot(model, c(2))
+dev.off()
+
+model <- lm(log10(HLADRA) ~ log10(Percentage)*LAG3_cluster*Project, data = combined_data_model)
+
+png('E:/Lorenzo/Final_TCGA/logged_residual_variance.png', width = 5000, height = 4000, res = 1000)
+plot(model, c(1))
+dev.off()
+png('E:/Lorenzo/Final_TCGA/logged_residual_normality.png', width = 5000, height = 4000, res = 1000)
+plot(model, c(2))
+dev.off()
+
+```
+
+
+```{r}
+
+COAD_MHC_cells <- COAD_CBSRT %>% dplyr::select(Mixture, LAG3_cluster, B.cells.naive, B.cells.memory, 
+                             Plasma.cells,Monocytes, Macrophages.M0, 
+                             Macrophages.M1, Macrophages.M2, Dendritic.cells.resting, Dendritic.cells.activated) %>%
+  pivot_longer(cols = !c(Mixture, LAG3_cluster), names_to = 'Population', values_to = 'Percentage') %>%
+  mutate(Project = 'COAD')
+
+BRCA_MHC_cells <- BRCA_CBSRT %>% dplyr::select(Mixture, LAG3_cluster, B.cells.naive, B.cells.memory, 
+                             Plasma.cells,Monocytes, Macrophages.M0, 
+                             Macrophages.M1, Macrophages.M2, Dendritic.cells.resting, Dendritic.cells.activated) %>%
+  pivot_longer(cols = !c(Mixture, LAG3_cluster), names_to = 'Population', values_to = 'Percentage') %>%
+  mutate(Project = 'BRCA')
+
+png('E:/Lorenzo/Final_TCGA/COAD_MHC_II_cells_vs_HLADRA.png', width = 11000, height = 11000, res = 1120)
+merge(COAD_MHC_cells,HLADRA_gene_counts, by = 'Mixture') %>% 
+  mutate(Population = factor(Population, levels = c
+                             ("B.cells.naive","B.cells.memory","Plasma.cells",
+                               "Macrophages.M0","Macrophages.M1","Macrophages.M2",
+                               "Monocytes","Dendritic.cells.resting","Dendritic.cells.activated")
+                             )) %>%
+  ggplot(., aes( x = Percentage,
+                 y = HLADRA,
+                  color = LAG3_cluster)) +
+  geom_smooth(method = 'lm', show.legend = F) +
+  geom_point() +
+  facet_wrap(~Population, scales = 'free') +
+ # scale_x_continuous(limits = c(0, 1)) +
+  scale_y_continuous(labels = scales::comma)  +
+  stat_poly_line() +
+  stat_poly_eq(aes(label = paste(..rr.label.., ..p.value.label.., sep = "*`,`~")), vjust = 0.5)  +
+  geom_smooth(method = "lm", se = FALSE) +
+  ylab('Normalised gene counts of HLA-DRA') +
+  xlab('Abundance of cell type') +
+  theme_pubclean() +
+  scale_color_manual(name = 'LAG3 expression cluster', values = c('brown3','darkgoldenrod1'), labels = c('LAG3 High','LAG3 Low')) +
+  theme(legend.position = 'bottom')
+dev.off()
+
+
+png('E:/Lorenzo/Final_TCGA/BRCA_MHC_II_cells_vs_HLADRA.png', width = 11000, height = 11000, res = 1120)
+merge(BRCA_MHC_cells,HLADRA_gene_counts, by = 'Mixture') %>% 
+  mutate(Population = factor(Population, levels = c
+                             ("B.cells.naive","B.cells.memory","Plasma.cells",
+                               "Macrophages.M0","Macrophages.M1","Macrophages.M2",
+                               "Monocytes","Dendritic.cells.resting","Dendritic.cells.activated")
+                             )) %>%
+  ggplot(., aes( x = Percentage,
+                 y = HLADRA,
+                  color = LAG3_cluster)) +
+  geom_smooth(method = 'lm', show.legend = F) +
+  geom_point() +
+  facet_wrap(~Population, scales = 'free') +
+ # scale_x_continuous(limits = c(0, 1)) +
+  scale_y_continuous(labels = scales::comma)  +
+  stat_poly_line() +
+  stat_poly_eq(aes(label = paste(..rr.label.., ..p.value.label.., sep = "*`,`~")), vjust = 0.5)  +
+  geom_smooth(method = "lm", se = FALSE) +
+  ylab('Normalised gene counts of HLA-DRA') +
+  xlab('Abundance of cell type') +
+  theme_pubclean() +
+  scale_color_manual(name = 'LAG3 expression cluster', values = c('brown3','darkgoldenrod1'), labels = c('LAG3 High','LAG3 Low')) +
+  theme(legend.position = 'bottom')
+dev.off()
+
+
+```
+
