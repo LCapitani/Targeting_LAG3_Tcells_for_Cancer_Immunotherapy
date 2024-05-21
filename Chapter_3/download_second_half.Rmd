@@ -1,0 +1,32 @@
+```{r}
+library(TCGAbiolinks)
+library(tidyverse)
+library(SummarizedExperiment)
+
+```
+
+
+```{r}
+gdcprojects  <- getGDCprojects()
+
+# Get the list of all TCGA project IDs in the database
+
+projects_to_download <- sort(gdcprojects[grep('TCGA', gdcprojects$id),]$id)
+
+# download first half of the data
+projects_to_download_second = projects_to_download[17:33]
+
+
+query_TCGA_second <- GDCquery(project = projects_to_download_second, 
+                       data.category = "Transcriptome Profiling",
+                       data.type = "Gene Expression Quantification",
+                       workflow.type = "STAR - Counts")
+
+
+GDCdownload(query_TCGA_second)
+
+
+data_second_half <- GDCprepare(query_TCGA_second, summarizedExperiment = TRUE)
+
+```
+

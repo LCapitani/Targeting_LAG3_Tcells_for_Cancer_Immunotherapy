@@ -1,0 +1,60 @@
+
+```{r}
+library(TCGAbiolinks)
+library(tidyverse)
+library(SummarizedExperiment)
+
+```
+
+```{r}
+gdcprojects  <- getGDCprojects()
+
+# Get the list of all TCGA project IDs in the database
+
+projects_to_download <- sort(gdcprojects[grep('TCGA', gdcprojects$id),]$id)
+
+# download first half of the data
+projects_to_download_first = projects_to_download[1:16]
+
+
+query_TCGA_first <- GDCquery(project = projects_to_download_first, 
+                       data.category = "Transcriptome Profiling",
+                       data.type = "Gene Expression Quantification",
+                       workflow.type = "STAR - Counts")
+
+
+GDCdownload(query_TCGA_first)
+
+
+data_first_half <- GDCprepare(query_TCGA_first, summarizedExperiment = TRUE)
+
+```
+
+
+
+```{r}
+clinical_TCGA <- query <- GDCquery(project = projects_to_download, 
+                   data.category = "Clinical")
+
+
+clinical_TCGA <- bind_rows(lapply(projects_to_download, function(project){
+  GDCquery_clinic(project)
+})
+)
+
+# filter clinical information to columns of interest
+
+clinical_data <- clinical_TCGA[,colnames(clinical_TCGA) %in% c('project','submitter_id','ajcc_pathologic_stage',
+                                              'days_to_diagnosis','vital_status', 
+                                              'days_to_death', 'days_to_last_follow_up',
+                                              'tumor_stage','tumor_grade')]
+
+
+
+```
+
+
+
+
+
+

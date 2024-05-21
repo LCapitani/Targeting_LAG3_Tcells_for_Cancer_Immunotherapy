@@ -1,0 +1,293 @@
+
+
+```{r}
+library(TCGAbiolinks)
+library(tidyverse)
+library(SummarizedExperiment)
+library(DESeq2)
+library(biomaRt)
+library(rtracklayer)
+library(parallel)
+library(BiocParallel)
+```
+
+```{r}
+setwd('E:/Lorenzo/Final_TCGA')
+projects_to_download = getGDCprojects()
+projects_to_download <- projects_to_download[grep('TCGA', projects_to_download$id),]
+
+normal_query <- GDCquery(project = projects_to_download$id,
+              data.category = "Transcriptome Profiling",
+              data.type = "Gene Expression Quantification", 
+              workflow.type = "STAR - Counts",
+              sample.type = c('Solid Tissue Normal'))
+
+GDCdownload(normal_query, directory = 'E:/Lorenzo/Final_TCGA')
+
+normal_samples <- GDCprepare(normal_query, directory = 'E:/Lorenzo/Final_TCGA')
+
+
+normal_df <- assay(normal_samples, 'unstranded') %>% as.data.frame(.)
+
+normal_sampe_info <- data.frame(normal_samples$patient,normal_samples$barcode,normal_samples$age_at_diagnosis,normal_samples$ajcc_pathologic_stage, normal_samples$days_to_diagnosis, normal_samples$vital_status, normal_samples$days_to_death, normal_samples$days_to_last_follow_up, normal_samples$tumor_grade, normal_samples$sample_type)
+colnames(normal_sampe_info) <- gsub('normal_samples.', '', colnames(normal_sampe_info))
+
+rm(normal_samples)
+rm(normal_query)
+```
+
+
+```{r}
+
+clinical_TCGA <- bind_rows(lapply(projects_to_download, function(project){
+  GDCquery_clinic(project)
+})
+)
+
+# filter clinical information to columns of interest
+
+clinical_data <- clinical_TCGA[,colnames(clinical_TCGA) %in% c('project','submitter_id','ajcc_pathologic_stage',
+                                              'days_to_diagnosis','vital_status', 
+                                              'days_to_death', 'days_to_last_follow_up',
+                                              'tumor_stage','tumor_grade')]
+
+#rename project column
+colnames(clinical_data)[1] <- 'project_id'
+# split clinical data by project
+clinical_data <- split(clinical_data, f = clinical_data$project_id)
+```
+
+
+
+```{r}
+# having loaded the first and second halfs of the data, now extract the wanted information and generate a list of data frames by project ID
+first_half_unstranded <- data.frame(assay(data_first_half), 'unstranded') %>% t(.) %>% as.data.frame(.) %>% .[1:nrow(.)-1,] %>%
+  mutate(submitter_id=data_first_half$submitter_id, 
+         project_id = data_first_half$project_id) %>% split(. , f = .$project_id)
+
+=
+second_half_unstranded <- data.frame(assay(data_second_half), 'unstranded') %>% t(.) %>% as.data.frame(.) %>% .[1:nrow(.)-1,] %>%
+  mutate(submitter_id=data_second_half$submitter_id, 
+         project_id = data_second_half$project_id) %>% split(. , f = .$project_id)
+
+
+full_data_set_list <- c(first_half_unstranded, second_half_unstranded)
+
+```
+
+
+```{r}
+rm(data_first_half)
+rm(data_second_half)
+rm(first_half_unstranded)
+rm(second_half_unstranded)
+rm(test)
+rm(clinical_TCGA)
+rm(gdcprojects)
+```
+
+
+```{r}
+# get ID of gene of interest which should be used to cluster patients
+LAG3 <- 'ENSG00000089692'
+LAG3_id <- grep(LAG3, names(full_data_set_list$`TCGA-BRCA`), value=TRUE)
+FGL1 <- 'ENSG00000104760'
+FGL1_id <- grep(FGL1, names(full_data_set_list$`TCGA-BRCA`), value=TRUE)
+```
+
+```{r}
+
+
+gene_names <- read.table(file = 'E:/Lorenzo/Final_TCGA/7f9dadec-d447-41be-a192-637ce36467da.rna_seq.augmented_star_gene_counts.tsv', sep = '\t', header = TRUE)[-c(1:4),]$gene_name
+
+library(purrr)
+```
+
+Load normal samples
+
+
+```{r}
+full_data_set_with_gene_names <- bind_cols(
+  imap(full_data_set_list, function(x,y){
+ x <- x %>% t(.) %>% as.data.frame(.)  %>% .[1:(nrow(.)-2),] %>% cbind(gene_names, .) %>% group_by(gene_names) %>% filter(row_number() <= 1) %>% as.data.frame(.) %>% `rownames<-`(.$gene_names) %>% dplyr::select(-gene_names)
+x[nrow(x) + 1, ] <- y
+rownames(x)[nrow(x)] <- 'project.id'
+return(x)
+ })
+)
+
+# add a type row to the full_data_Set
+full_data_set_with_gene_names[nrow(full_data_set_with_gene_names)+1,] <- 'Tumour'
+normal_samples_with_gene_names[nrow(normal_samples_with_gene_names)+1,] <- 'Healthy'
+rownames(normal_samples_with_gene_names)[nrow(normal_samples_with_gene_names)] <- 'sample.type'
+rownames(full_data_set_with_gene_names)[nrow(full_data_set_with_gene_names)] <- 'sample.type'
+
+
+tumour_and_noraml_with_gene_names <- cbind(full_data_set_with_gene_names, normal_samples_with_gene_names)
+
+
+rm(full_data_set_list)
+rm(full_data_set_with_gene_names)
+```
+
+```{r}
+tumour_and_noraml_with_gene_names[1:59427,]
+
+
+```
+
+
+```{r}
+exptDesign_TCGA <- tumour_and_noraml_with_gene_names[59428:59429,] %>% t(.) %>% as.data.frame(.)
+
+dds <- DESeqDataSetFromMatrix(
+  countData = tumour_and_noraml_with_gene_names[1:59427,] %>% mutate(across(where(is.character), as.numeric)),
+  colData = exptDesign_TCGA,
+  design = ~ project.id)
+
+
+dds <- DESeq2::estimateSizeFactors(dds)
+
+all_norm_counts <- DESeq2::counts(dds, normalized=TRUE) %>% as.data.frame(.)
+
+```
+
+
+```{r}
+require(scales)
+require(ggpubr)
+
+
+# first lets visualize how many samples are in each project and by sample type
+
+sample_numbers <- table(exptDesign_TCGA$project.id, exptDesign_TCGA$sample.type) %>% as.data.frame(.) 
+colnames(sample_numbers) <- c('project.id','sample.type','freq')
+plot <- sample_numbers %>% ggplot(., aes(fill=sample.type, y=freq, x=project.id)) + 
+    geom_bar(position="dodge", stat="identity") + theme_pubclean() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  scale_fill_manual(name = 'Sample type', labels = c('Healthy','Tumour'), values = c('aquamarine4','coral3')) +
+  ylab('Number of samples in cohort') +
+  xlab('TCGA project')
+  path = 'E:/Lorenzo/Final_TCGA/Results/number_of_samples_in_each_project.pdf'
+  pdf(path, width = 10, height = 5)
+  print(plot, newpage = FALSE)
+  dev.off()
+
+plot <- all_norm_counts %>% filter(row.names(.) %in% c("LAG3")) %>% pivot_longer(cols = everything(), names_to = 'submitter_id', values_to = 'LAG3_gene_count') %>% mutate(project.id = exptDesign_TCGA$project.id) %>% 
+  mutate(sample.type = exptDesign_TCGA$sample.type) %>% 
+  mutate(Gene = 'LAG-3') %>% ggplot(.,
+                         aes( x = project.id, 
+                              y= LAG3_gene_count,
+                              fill = sample.type)) +
+  geom_boxplot() +
+  scale_y_continuous(trans = 'log10', labels = scales::comma, limits = c(1,100000), breaks = c(1,10,100,1000,10000,100000)) +
+  ylab('Normalized gene counts') +
+  xlab('TCGA Project') + theme_pubclean() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + facet_grid(cols = vars(Gene)) +
+  scale_fill_manual(name = 'Sample type', labels = c('Healthy','Tumour'), values = c('aquamarine4','coral3'))
+  path = 'E:/Lorenzo/Final_TCGA/Results/Expression of LAG3 and ligands pan-cancer/LAG3.pdf'
+  pdf(path, width = 10, height = 5)
+  print(plot, newpage = FALSE)
+  dev.off()
+  
+plot <- all_norm_counts %>% filter(row.names(.) %in% c("FGL1")) %>% pivot_longer(cols = everything(), names_to = 'submitter_id', values_to = 'LAG3_gene_count') %>% mutate(project.id = exptDesign_TCGA$project.id) %>% 
+  mutate(sample.type = exptDesign_TCGA$sample.type) %>% 
+  mutate(Gene = 'FGL-1') %>% ggplot(.,
+                         aes( x = project.id, 
+                              y= LAG3_gene_count,
+                              fill = sample.type)) +
+  geom_boxplot() +
+  scale_y_continuous(trans = 'log10', labels = scales::comma, limits = c(1,100000), breaks = c(1,10,100,1000,10000,100000)) +
+  ylab('Normalized gene counts') +
+  xlab('TCGA Project') + theme_pubclean() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + facet_grid(cols = vars(Gene)) +
+  scale_fill_manual(name = 'Sample type', labels = c('Healthy','Tumour'), values = c('aquamarine4','coral3'))
+  path = 'E:/Lorenzo/Final_TCGA/Results/Expression of LAG3 and ligands pan-cancer/FGL1.pdf'
+  pdf(path, width = 10, height = 5)
+  print(plot, newpage = FALSE)
+  dev.off()
+  
+plot <- all_norm_counts %>% filter(row.names(.) %in% c("HLA-DRA")) %>% pivot_longer(cols = everything(), names_to = 'submitter_id', values_to = 'LAG3_gene_count') %>% mutate(project.id = exptDesign_TCGA$project.id) %>% 
+  mutate(sample.type = exptDesign_TCGA$sample.type) %>% 
+  mutate(Gene = 'HLA-DRA') %>% ggplot(.,
+                         aes( x = project.id, 
+                              y= LAG3_gene_count,
+                              fill = sample.type)) +
+  geom_boxplot() +
+  scale_y_continuous(trans = 'log10', labels = scales::comma, limits = c(1,100000), breaks = c(1,10,100,1000,10000,100000)) +
+  ylab('Normalized gene counts') +
+  xlab('TCGA Project') + theme_pubclean() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + facet_grid(cols = vars(Gene)) +
+  scale_fill_manual(name = 'Sample type', labels = c('Healthy','Tumour'), values = c('aquamarine4','coral3'))
+  path = 'E:/Lorenzo/Final_TCGA/Results/Expression of LAG3 and ligands pan-cancer/HLA_DRA.pdf'
+  pdf(path, width = 10, height = 5)
+  print(plot, newpage = FALSE)
+  dev.off()
+  
+
+  plot <- all_norm_counts %>% filter(row.names(.) %in% c("LGALS3")) %>% pivot_longer(cols = everything(), names_to = 'submitter_id', values_to = 'LAG3_gene_count') %>% mutate(project.id = exptDesign_TCGA$project.id) %>% 
+  mutate(sample.type = exptDesign_TCGA$sample.type) %>% 
+  mutate(Gene = 'Galectin-3') %>% ggplot(.,
+                         aes( x = project.id, 
+                              y= LAG3_gene_count,
+                              fill = sample.type)) +
+  geom_boxplot() +
+  scale_y_continuous(trans = 'log10', labels = scales::comma, limits = c(1,100000), breaks = c(1,10,100,1000,10000,100000)) +
+  ylab('Normalized gene counts') +
+  xlab('TCGA Project') + theme_pubclean() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + facet_grid(cols = vars(Gene)) +
+  scale_fill_manual(name = 'Sample type', labels = c('Healthy','Tumour'), values = c('aquamarine4','coral3'))
+  path = 'E:/Lorenzo/Final_TCGA/Results/Expression of LAG3 and ligands pan-cancer/Gal3.pdf'
+  pdf(path, width = 10, height = 5)
+  print(plot, newpage = FALSE)
+  dev.off()
+  
+  plot <- all_norm_counts %>% filter(row.names(.) %in% c("CLEC4G")) %>% pivot_longer(cols = everything(), names_to = 'submitter_id', values_to = 'LAG3_gene_count') %>% mutate(project.id = exptDesign_TCGA$project.id) %>% 
+  mutate(sample.type = exptDesign_TCGA$sample.type) %>% 
+  mutate(Gene = 'LSECTIN') %>% ggplot(.,
+                         aes( x = project.id, 
+                              y= LAG3_gene_count,
+                              fill = sample.type)) +
+  geom_boxplot() +
+  scale_y_continuous(trans = 'log10', labels = scales::comma, limits = c(1,100000), breaks = c(1,10,100,1000,10000,100000)) +
+  ylab('Normalized gene counts') +
+  xlab('TCGA Project') + theme_pubclean() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + facet_grid(cols = vars(Gene)) +
+  scale_fill_manual(name = 'Sample type', labels = c('Healthy','Tumour'), values = c('aquamarine4','coral3'))
+  path = 'E:/Lorenzo/Final_TCGA/Results/Expression of LAG3 and ligands pan-cancer/LSECTIN.pdf'
+  pdf(path, width = 10, height = 5)
+  print(plot, newpage = FALSE)
+  dev.off()
+  
+  plot <- all_norm_counts %>% filter(row.names(.) %in% c("SNCA")) %>% pivot_longer(cols = everything(), names_to = 'submitter_id', values_to = 'LAG3_gene_count') %>% mutate(project.id = exptDesign_TCGA$project.id) %>% 
+  mutate(sample.type = exptDesign_TCGA$sample.type) %>% 
+  mutate(Gene = 'Alpha-synuclein') %>% ggplot(.,
+                         aes( x = project.id, 
+                              y= LAG3_gene_count,
+                              fill = sample.type)) +
+  geom_boxplot() +
+  scale_y_continuous(trans = 'log10', labels = scales::comma, limits = c(1,100000), breaks = c(1,10,100,1000,10000,100000)) +
+  ylab('Normalized gene counts') +
+  xlab('TCGA Project') + theme_pubclean() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + facet_grid(cols = vars(Gene)) +
+  scale_fill_manual(name = 'Sample type', labels = c('Healthy','Tumour'), values = c('aquamarine4','coral3'))
+  path = 'E:/Lorenzo/Final_TCGA/Results/Expression of LAG3 and ligands pan-cancer/SNCA.pdf'
+  pdf(path, width = 10, height = 5)
+  print(plot, newpage = FALSE)
+  dev.off()
+```
+
+```{r, fig.width=6, fig.height=8}
+library(scales)
+all_norm_counts %>% filter(row.names(.) %in% c("FGL1","LGALS3","CLEC4G","HLA-DRB1","SNCA")) %>% cbind(rownames(.), .) %>% rename(., Gene = 'rownames(.)') %>% pivot_longer(cols = !Gene, names_to = 'submitter_id', values_to = 'gene_count') %>% mutate(project.id = c(exptDesign_TCGA$project.id,
+                  exptDesign_TCGA$project.id,
+                  exptDesign_TCGA$project.id,
+                  exptDesign_TCGA$project.id,
+                  exptDesign_TCGA$project.id
+                  )) %>% mutate(gene_count = log10(gene_count)) %>%  mutate(gene_count = ifelse(is.infinite(gene_count), 0, gene_count)) %>% mutate(Gene = replace(Gene, Gene == 'LGALS3', 'Galectin-3')) %>% 
+  mutate(Gene = replace(Gene, Gene == 'CLEC4G', 'LSECTIN')) %>% 
+  mutate(Gene = replace(Gene, Gene == 'SNCA', 'Alpha synuclein')) 
+
+
+
+
+%>% ggplot(., aes( x = project.id, y = gene_count)) +
+  geom_boxplot() +
+  ylab('log10(Normalized gene counts)') +
+  xlab('TCGA Project') + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  facet_wrap(~ Gene, nrow = 5, strip.position="top")
+```
+
